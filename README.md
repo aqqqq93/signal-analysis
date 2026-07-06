@@ -17,6 +17,10 @@ Stage 1 is the active implementation. It contains:
 - hard router and expert models;
 - guarded top-2 candidate routing;
 - secondary quality selector;
+- confidence and top-2 candidate export;
+- crossing identity-continuity postprocessing;
+- local-jump event auxiliary head;
+- Stage-1 readiness gate for deciding when Stage 2 can start;
 - evaluation and prediction scripts;
 - PDF summary generation script.
 

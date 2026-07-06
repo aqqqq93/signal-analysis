@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from .model import IFNetUNet, model_config_from_dict, soft_argmax_if
+from .jump_aux import IFNetJumpAux
 from .postprocess import apply_if_postprocess
 from .predict_routed import DEFAULT_EXPERTS, DEFAULT_POSTPROCESS
 from .quality_selector import QualitySelector, quality_selector_config_from_dict, select_candidate_with_quality
@@ -120,7 +121,8 @@ def evaluate_routed(
                     model, sim_cfg, stft_cfg, model_cfg = experts[route_name]
                     signal = batch["signal"][sample_idx : sample_idx + 1]
                     feats, freq_grid = log_spectrogram(signal, stft_cfg, sim_cfg.fs)
-                    logits = model(feats)
+                    model_out = model(feats)
+                    logits = model_out[0] if isinstance(model_out, tuple) else model_out
                     pred_if, probs = soft_argmax_if(logits, freq_grid, model_cfg.temperature)
                     pred_if = apply_if_postprocess(
                         pred_if,
@@ -184,7 +186,10 @@ def load_expert(path: str | Path, device: torch.device):
     sim_cfg = sim_config_from_dict(cfg["data"])
     stft_cfg = stft_config_from_dict(cfg["stft"])
     model_cfg = model_config_from_dict(cfg["model"])
-    model = IFNetUNet(feature_channels(stft_cfg), sim_cfg.num_components, model_cfg).to(device)
+    if ckpt.get("model_type") == "IFNetJumpAux":
+        model = IFNetJumpAux(feature_channels(stft_cfg), sim_cfg.num_components, model_cfg).to(device)
+    else:
+        model = IFNetUNet(feature_channels(stft_cfg), sim_cfg.num_components, model_cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, sim_cfg, stft_cfg, model_cfg

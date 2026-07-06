@@ -137,6 +137,76 @@ def despike_if(
     return out
 
 
+@torch.no_grad()
+def track_continuity_viterbi(
+    pred_if: torch.Tensor,
+    switch_penalty_hz: float = 8.0,
+    velocity_weight: float = 0.55,
+) -> torch.Tensor:
+    """Relabel two IF tracks over time to reduce local identity swaps.
+
+    This keeps the estimated frequencies unchanged at each frame and only
+    chooses whether the two component labels should be swapped. It is useful
+    for crossing/overlap cases where a heatmap component can briefly follow
+    the wrong physical branch.
+    """
+
+    if pred_if.ndim != 3:
+        raise ValueError(f"Expected pred_if [B,Q,T], got {tuple(pred_if.shape)}")
+    bsz, q, frames = pred_if.shape
+    if q != 2 or frames < 2:
+        return pred_if
+
+    perms = (
+        torch.tensor([0, 1], device=pred_if.device),
+        torch.tensor([1, 0], device=pred_if.device),
+    )
+    out = torch.empty_like(pred_if)
+    penalty = float(switch_penalty_hz)
+    vel_w = float(velocity_weight)
+
+    for b in range(bsz):
+        values = pred_if[b]
+        paths = [[0], [1]]
+        costs = [values.new_tensor(0.0), values.new_tensor(0.0)]
+        prev_assigned = [values[perms[0], 0], values[perms[1], 0]]
+        prev_vel = [torch.zeros(2, device=values.device, dtype=values.dtype), torch.zeros(2, device=values.device, dtype=values.dtype)]
+
+        for t in range(1, frames):
+            next_costs = []
+            next_paths = []
+            next_assigned = []
+            next_vel = []
+            for state, perm in enumerate(perms):
+                current = values[perm, t]
+                best = None
+                best_prev = 0
+                best_vel = None
+                for prev_state in range(2):
+                    vel = current - prev_assigned[prev_state]
+                    step_cost = vel.abs().mean()
+                    accel_cost = (vel - prev_vel[prev_state]).abs().mean()
+                    switch_cost = values.new_tensor(penalty if state != prev_state else 0.0)
+                    total = costs[prev_state] + step_cost + vel_w * accel_cost + switch_cost
+                    if best is None or bool(total < best):
+                        best = total
+                        best_prev = prev_state
+                        best_vel = vel
+                next_costs.append(best)
+                next_paths.append(paths[best_prev] + [state])
+                next_assigned.append(current)
+                next_vel.append(best_vel)
+            costs = next_costs
+            paths = next_paths
+            prev_assigned = next_assigned
+            prev_vel = next_vel
+
+        best_final = 0 if bool(costs[0] <= costs[1]) else 1
+        for t, state in enumerate(paths[best_final]):
+            out[b, :, t] = values[perms[state], t]
+    return out
+
+
 def apply_if_postprocess(
     pred_if: torch.Tensor,
     mode: str = "none",
@@ -165,4 +235,6 @@ def apply_if_postprocess(
         )
     if mode in {"despike", "median_spike", "jump_despike"}:
         return despike_if(pred_if, threshold_hz=huber_hz, median_kernel=5)
+    if mode in {"track", "identity", "identity_viterbi", "cross_identity"}:
+        return track_continuity_viterbi(pred_if, switch_penalty_hz=huber_hz)
     raise ValueError(f"Unknown IF postprocess mode: {mode}")

@@ -102,3 +102,45 @@ current hard route plus specialists is usually cleaner:
 ```powershell
 .\.venv_ifnet\Scripts\python.exe -m ifnet_stage1.eval_routed_scenarios --router-checkpoint .\ifnet_stage1\runs\router_hard_v3\latest.pt --output-dir .\ifnet_stage1\runs\router_hard_v3\eval_routed_all_specialists_fallback --fallback --fallback-confidence 0.78 --fallback-margin 0.18
 ```
+
+## Stage-1 Readiness Gate
+
+Stage 1 should not be frozen for Stage 2 only because the average IF MAE looks
+acceptable. The handoff check also verifies confidence, top-2 candidate
+coverage, crossing identity continuity, and local-jump event timing:
+
+```powershell
+.\.venv_ifnet\Scripts\python.exe -m ifnet_stage1.eval_stage1_readiness `
+  --router-checkpoint .\ifnet_stage1\runs\router_hard_v3\latest.pt `
+  --output-dir .\ifnet_stage1\runs\stage1_readiness_v1 `
+  --batch-size 16 --batches 8 `
+  --quality-selector-checkpoint .\ifnet_stage1\runs\quality_selector_v1\latest.pt `
+  --quality-selector-margin 0.10 `
+  --quality-protect-top-routes cross_overlap_like `
+  --jump-aux-checkpoint .\ifnet_stage1\runs\local_jump_aux_v1\latest.pt
+```
+
+The script writes `readiness_metrics.json` and returns `ready_for_stage2`.
+The current acceptance gates are:
+
+- overall selected IF MAE <= 5.5 Hz;
+- top-2 oracle coverage at 10 Hz >= 88%;
+- high-confidence subset MAE <= 5 Hz with at least 55% coverage;
+- crossing fixed-identity MAE <= 12 Hz and identity excess <= 8 Hz;
+- local-jump IF MAE <= 10.5 Hz and P95 <= 40 Hz;
+- local-jump event MAE <= 80 ms;
+- sinusoidal-FM MAE <= 8.5 Hz.
+
+## Local-Jump Auxiliary Head
+
+`IFNetJumpAux` adds a temporal jump-location head on top of IF-Net. It is
+intended to provide event timing for Stage 2 while the existing local-jump
+expert remains responsible for the IF curve itself.
+
+```powershell
+.\.venv_ifnet\Scripts\python.exe -m ifnet_stage1.train_jump_aux `
+  --config .\ifnet_stage1\configs\local_jump_aux.yaml
+```
+
+For now, use the auxiliary checkpoint through `--jump-aux-checkpoint` in the
+readiness evaluator instead of replacing the main jump expert.

@@ -53,6 +53,37 @@ class QualitySelector(nn.Module):
 
 
 @torch.no_grad()
+def score_candidates_with_quality(
+    selector: QualitySelector,
+    route_probs: torch.Tensor,
+    candidates: list[tuple[int, str, torch.Tensor, torch.Tensor]],
+    route_names: tuple[str, ...],
+) -> dict[str, float]:
+    """Return selector scores keyed by route name for candidate diagnostics."""
+
+    if not candidates:
+        return {}
+    features = torch.stack(
+        [
+            candidate_quality_features(
+                route_probs,
+                route_idx,
+                pred_if,
+                ridge_probs,
+                num_routes=len(route_names),
+            )
+            for route_idx, _route_name, pred_if, ridge_probs in candidates
+        ],
+        dim=0,
+    )
+    scores = selector(features)
+    return {
+        route_name: float(score.detach().cpu())
+        for score, (_route_idx, route_name, _pred_if, _ridge_probs) in zip(scores, candidates, strict=False)
+    }
+
+
+@torch.no_grad()
 def select_candidate_with_quality(
     selector: QualitySelector,
     route_probs: torch.Tensor,

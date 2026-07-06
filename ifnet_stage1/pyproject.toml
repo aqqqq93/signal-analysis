@@ -25,6 +25,8 @@ ifnet-eval-routed = "ifnet_stage1.eval_routed_scenarios:main"
 ifnet-predict-routed = "ifnet_stage1.predict_routed:main"
 ifnet-train-quality-selector = "ifnet_stage1.train_quality_selector:main"
 ifnet-eval-quality-selector = "ifnet_stage1.eval_quality_selector:main"
+ifnet-train-jump-aux = "ifnet_stage1.train_jump_aux:main"
+ifnet-eval-readiness = "ifnet_stage1.eval_stage1_readiness:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
