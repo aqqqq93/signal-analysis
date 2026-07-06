@@ -1,4 +1,4 @@
-# ICCD IF Estimation Pipeline
+# signal-analysis
 
 This repository manages the code for a three-stage ICCD-oriented signal analysis pipeline.
 
@@ -42,4 +42,3 @@ Current stage-1 technical report:
 ```text
 output/pdf/ifnet_stage1_summary.pdf
 ```
-
