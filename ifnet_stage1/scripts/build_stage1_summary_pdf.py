@@ -18,6 +18,9 @@ OUT_DIR = ROOT.parent / "output" / "pdf"
 FIG_DIR = ROOT / "runs" / "router_hard_v3" / "stable_combo_all_figures"
 BASELINE_METRICS_PATH = ROOT / "runs" / "router_hard_v3" / "eval_soft_guarded_top2_all" / "routed_metrics.json"
 QUALITY_METRICS_PATH = ROOT / "runs" / "quality_selector_v1" / "eval_routed_quality_protect_cross_all" / "routed_metrics.json"
+READINESS_PATH = ROOT / "runs" / "stage1_readiness_aux_v2_guarded_candidates" / "readiness_metrics.json"
+READINESS_SEED2_PATH = ROOT / "runs" / "stage1_readiness_aux_v2_guarded_candidates_seed67890" / "readiness_metrics.json"
+SINUSOIDAL_CHECK_PATH = ROOT / "runs" / "stage1_readiness_sinusoidal_check_seed67890" / "readiness_metrics.json"
 EXAMPLE_PATH = FIG_DIR / "example_metrics.json"
 PDF_PATH = OUT_DIR / "ifnet_stage1_summary.pdf"
 
@@ -209,6 +212,28 @@ def add_comparison_table(story: list, baseline: dict, quality: dict, styles: dic
     story.append(styled_table(para_rows(raw, styles), [5.2 * cm, 3.0 * cm, 3.6 * cm, 2.5 * cm], "#efe7f6"))
 
 
+def pass_text(value: bool) -> str:
+    return "通过" if value else "未过"
+
+
+def add_readiness_table(story: list, readiness: dict, styles: dict[str, ParagraphStyle]) -> None:
+    gates = readiness["gates"]
+    aggregate = readiness["aggregate"]
+    scenarios = readiness["scenarios"]
+    local_jump = scenarios["local_jump"]
+    raw = [
+        ["准入项", "当前值", "门槛", "结论"],
+        ["总体 IF MAE", f"{aggregate['avg_mae_hz']:.2f} Hz", "<= 5.5 Hz", pass_text(gates["overall_mae"]["pass"])],
+        ["top-2 候选覆盖率", f"{aggregate['candidate_oracle_coverage_10hz'] * 100:.2f}%", ">= 88%", pass_text(gates["top2_candidate_coverage"]["pass"])],
+        ["高置信样本 MAE", f"{aggregate['high_confidence_mae_hz']:.2f} Hz", "<= 5.0 Hz", pass_text(gates["high_confidence_quality"]["pass"])],
+        ["crossing 身份稳定", f"{scenarios['crossing']['identity_excess_hz']:.2f} Hz", "<= 8.0 Hz", pass_text(gates["crossing_identity"]["pass"])],
+        ["local_jump IF", f"{local_jump['if_mae_hz']:.2f} Hz / P95 {local_jump['if_mae_hz_p95']:.2f} Hz", "<= 10.5 / 40 Hz", pass_text(gates["local_jump_if"]["pass"])],
+        ["local_jump 跳变定位", f"{local_jump['jump_event_mae_ms']:.2f} ms", "<= 80 ms", pass_text(gates["local_jump_event"]["pass"])],
+        ["sinusoidal_fm MAE", f"{scenarios['sinusoidal_fm']['if_mae_hz']:.2f} Hz", "<= 8.5 Hz", pass_text(gates["sinusoidal_quality"]["pass"])],
+    ]
+    story.append(styled_table(para_rows(raw, styles), [4.6 * cm, 4.2 * cm, 3.4 * cm, 2.0 * cm], "#e8f4f1"))
+
+
 def add_example_table(story: list, examples: dict, styles: dict[str, ParagraphStyle]) -> None:
     raw = [["信号类型", "样本 MAE/Hz", "Top route", "Selected route", "Fallback"]]
     for name, label in SCENARIO_LABELS.items():
@@ -238,6 +263,9 @@ def build_pdf() -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     baseline_metrics = json.loads(BASELINE_METRICS_PATH.read_text(encoding="utf-8"))
     quality_metrics = json.loads(QUALITY_METRICS_PATH.read_text(encoding="utf-8"))
+    readiness = json.loads(READINESS_PATH.read_text(encoding="utf-8"))
+    readiness_seed2 = json.loads(READINESS_SEED2_PATH.read_text(encoding="utf-8"))
+    sinusoidal_check = json.loads(SINUSOIDAL_CHECK_PATH.read_text(encoding="utf-8"))
     examples = json.loads(EXAMPLE_PATH.read_text(encoding="utf-8"))
     styles = make_styles()
 
@@ -338,51 +366,80 @@ def build_pdf() -> Path:
             "完成硬判别器、增强判别器、guarded soft top-2 路由策略、二级质量判别器的训练与比较。",
             "已将质量判别器接入 eval_routed_scenarios.py 和 predict_routed.py；预测时可通过 --quality-selector-checkpoint 启用。",
             "完成 local_jump 分段线性跳变保持后处理实验，结果变差，因此已撤回该后处理，不作为主流程。",
+            "新增 IFNetJumpAux 跳变位置辅助头，把 local_jump 从单纯 ridge heatmap 学习扩展为 ridge + jump event 联合学习。",
+            "新增 guarded_special top-2 候选导出策略，优先保留 top-1，同时保护 sinusoidal_like 与 jump_like 作为第二候选，提高候选覆盖率。",
+            "新增 Stage-2 readiness 准入评估脚本，用 IF 精度、置信度、top-2 覆盖率、crossing 身份稳定性和 local_jump 跳变定位共同判断是否可进入第二阶段。",
         ],
         styles["body"],
     )
 
-    story.append(p("八、全类型定量结果（当前最新组合）", styles["h1"]))
-    story.append(p("以下指标来自每类 512 个仿真样本，使用 v3 路由器、四专家、guarded top-2 fallback 与二级质量判别器。", styles["body"]))
+    story.append(PageBreak())
+    story.append(p("八、全类型定量结果（质量判别器组合）", styles["h1"]))
+    story.append(p("以下指标来自每类 512 个仿真样本，使用 v3 路由器、四专家、guarded top-2 fallback 与二级质量判别器，主要用于说明质量判别器相对上一版路由规则的改进。加入 jump_aux、top-2 候选覆盖率和第二阶段准入门槛后的最新判断见下一节。", styles["body"]))
     add_metric_table(story, quality_metrics, styles)
     story.append(Spacer(1, 0.25 * cm))
     story.append(p("与上一版 guarded top-2 规则的对比", styles["h2"]))
     add_comparison_table(story, baseline_metrics, quality_metrics, styles)
 
     story.append(PageBreak())
-    story.append(p("九、代表样本处理结果", styles["h1"]))
+    story.append(p("九、第二阶段准入评估", styles["h1"]))
+    story.append(
+        p(
+            "准入评估使用 router_hard_v3、quality_selector_v1、local_jump_aux_v2 和 guarded_special top-2 候选导出。"
+            f"当前主评估 ready_for_stage2={readiness['ready_for_stage2']}；"
+            f"local_jump 跳变事件平均定位误差为 {readiness['scenarios']['local_jump']['jump_event_mae_ms']:.2f} ms，"
+            f"top-2 候选覆盖率为 {readiness['aggregate']['candidate_oracle_coverage_10hz'] * 100:.2f}%。",
+            styles["body"],
+        )
+    )
+    add_readiness_table(story, readiness, styles)
+    story.append(Spacer(1, 0.25 * cm))
+    story.append(
+        p(
+            f"为检查稳定性，又使用 seed=67890 复核：top-2 候选覆盖率为 {readiness_seed2['aggregate']['candidate_oracle_coverage_10hz'] * 100:.2f}%，"
+            f"local_jump 跳变事件平均定位误差为 {readiness_seed2['scenarios']['local_jump']['jump_event_mae_ms']:.2f} ms。"
+            f"该复核中 sinusoidal_fm 小样本 MAE 波动到 {readiness_seed2['scenarios']['sinusoidal_fm']['if_mae_hz']:.2f} Hz，"
+            f"但扩大到 512 个 sinusoidal 样本后为 {sinusoidal_check['scenarios']['sinusoidal_fm']['if_mae_hz']:.2f} Hz，说明主要是小样本波动，不应单独阻止进入第二阶段。",
+            styles["body"],
+        )
+    )
+
+    story.append(PageBreak())
+    story.append(p("十、代表样本处理结果", styles["h1"]))
     story.append(p("每类信号各抽取一个代表样本，图中绿色为真实 IF，蓝色虚线为预测 IF。该代表图仍来自稳定组合可视化样本，用于观察典型脊线拟合形态。", styles["body"]))
     add_example_table(story, examples, styles)
 
     story.append(PageBreak())
-    story.append(p("十、全类型处理图总览", styles["h1"]))
+    story.append(p("十一、全类型处理图总览", styles["h1"]))
     add_image(story, FIG_DIR / "all_scenarios_overview.png", max_width=18.0 * cm, max_height=17.0 * cm)
 
     story.append(PageBreak())
-    story.append(p("十一、存在的问题", styles["h1"]))
+    story.append(p("十二、存在的问题", styles["h1"]))
     add_bullets(
         story,
         [
-            "local_jump 仍是主要短板。质量判别器后平均 MAE 为 9.06 Hz，P95 为 34.76 Hz，说明局部突变边界和跳变幅度估计仍不够稳。",
-            "sinusoidal_fm 在复杂调频和弱分量时误差仍偏高，平均 MAE 为 7.39 Hz，P95 为 33.42 Hz。",
+            "local_jump 的平均跳变定位已经达到第二阶段准入要求，但尾部误差仍存在：主评估 jump_event P95 约 208.98 ms，说明少数弱分量、平滑过渡或局部 bump 样本仍会把跳变边界判断偏。",
+            "local_jump IF 平均误差已经通过门槛，但 P95 仍接近 30 Hz，后续第二阶段应把这类样本视为低置信初值，而不是强约束精确脊线。",
+            "sinusoidal_fm 在复杂调频和弱分量时仍有长尾误差；seed=67890 的小样本复核曾波动到 8.80 Hz，扩大样本后回到 7.19 Hz，说明需要继续扩大验证集并保留置信度输出。",
             "crossing 的平均 MAE 不高，但个别样本会明显拟合差。原因是两条 IF 在交叉点频率重合，STFT 幅值图中两条脊线会合成亮斑，仅靠幅值谱很难判断分量应当穿过交叉点还是交换身份。",
-            "当前 IF-Net 缺少 crossing identity continuity 约束，因此交叉点附近可能局部跟随能量最强脊线，而不是保持同一物理分量身份。",
-            "二级质量判别器若无保护会误伤 crossing，因此当前加入 cross_overlap_like top-1 保护。这说明不同场景的风险不对称，不能让质量判别器无条件覆盖 top-1。",
+            "当前已加入 crossing identity Viterbi 后处理并通过身份稳定门槛，但交叉点局部仍可能出现能量主导的短时偏移，因此第二阶段要使用 top-2 候选和置信度来消化这类不确定性。",
+            "二级质量判别器若无保护会误伤 crossing，因此当前加入 cross_overlap_like top-1 保护和 guarded_special 候选策略。这说明不同场景的风险不对称，不能让质量判别器无条件覆盖 top-1。",
             "local_jump 的分段线性跳变保持后处理实验失败：local_jump 专家独立评估 MAE 从约 9.65 Hz 变差到约 11.92 Hz，说明误差不是简单两段直线可修复，sigmoid 过渡、局部 bump 和分量弱化很重要。",
             "路由标签准确率不等同于最终 IF 精度。质量判别器会降低某些场景的路由标签准确率，但最终 IF MAE 仍有改善。",
         ],
         styles["body"],
     )
 
-    story.append(p("十二、优化方向与下一步计划", styles["h1"]))
+    story.append(p("十三、优化方向与下一步计划", styles["h1"]))
     add_bullets(
         story,
         [
-            "下一步优先做 local_jump 的 jump location 辅助头：让模型同时预测 ridge heatmap 和跳变位置/边界置信度，把任务从单纯 IF 回归变成 ridge + event 联合学习。",
-            "针对 local_jump 增强训练数据，增加跳变位置、跳变幅度、过渡宽度、局部 bump、弱分量遮蔽的覆盖密度。",
-            "对 crossing 和短时重合加入连续身份约束，降低分量交换对后续 ICCD 参数反演的影响；可尝试 crossing-aware tracking、最小曲率/最小加速度约束或交叉点前后身份一致性 loss。",
+            "第一阶段已经可以作为第二阶段 ICCD 参数估计的初始 IF 输入，但进入第二阶段时不应要求预测 IF 完全贴合真实脊线；应使用 IF 曲线、top-2 候选和置信度共同提供可优化初值。",
+            "继续提升 local_jump 的尾部稳定性，重点降低 jump_event P95；训练上可增加弱分量、平滑跳变、局部 bump 和跳变邻域噪声遮蔽样本。",
+            "继续提高 top-2 候选覆盖率的跨 seed 稳定性，当前主评估为 88.18%，seed=67890 为 90.43%，后续目标是稳定保持在 90% 左右。",
+            "对 crossing 和短时重合继续加强连续身份约束，降低分量交换对后续 ICCD 参数反演的影响；可尝试 crossing-aware tracking、最小曲率/最小加速度约束或交叉点前后身份一致性 loss。",
             "为 cross_overlap_like 专家尝试多尺度 STFT 或复数/相位相关特征，使模型获得幅值谱之外的分支区分信息。",
-            "继续扩大质量判别器训练集和验证集，减少小验证批次导致的 best checkpoint 偏差；当前推荐 quality_selector_v1/latest.pt，而非 v2 best。",
+            "继续扩大质量判别器和 readiness 验证集，减少小验证批次导致的 best checkpoint 偏差；当前推荐 quality_selector_v1/latest.pt 和 local_jump_aux_v2/latest.pt。",
             "固定第一阶段接口：输出 IF 曲线、ridge heatmap、路由概率、专家标签、质量判别器分数和不确定性指标，为第二阶段 ICCD 参数估计做准备。",
         ],
         styles["body"],
