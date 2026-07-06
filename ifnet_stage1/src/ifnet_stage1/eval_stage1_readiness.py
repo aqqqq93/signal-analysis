@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from .confidence import combined_initial_confidence
-from .jump_aux import jump_location_from_if, jump_location_from_logits
+from .jump_aux import jump_location_from_centers, jump_location_from_if, jump_location_from_logits
 from .model import soft_argmax_if
 from .postprocess import apply_if_postprocess
 from .predict_routed import DEFAULT_EXPERTS, DEFAULT_POSTPROCESS, load_expert, load_quality_selector
@@ -51,6 +51,27 @@ def best_mae(pred: torch.Tensor, target: torch.Tensor) -> float:
     return float((best_align(pred, target) - target).abs().mean().detach().cpu())
 
 
+def best_event_frame_error(pred_jump: torch.Tensor, target_jump: torch.Tensor, valid: torch.Tensor | None = None) -> float:
+    """Permutation-aware event frame error for component-wise jump locations."""
+
+    pred_jump = pred_jump.reshape(-1)
+    target_jump = target_jump.reshape(-1)
+    if valid is None:
+        valid = torch.ones_like(target_jump, dtype=torch.bool)
+    else:
+        valid = valid.reshape(-1).to(dtype=torch.bool)
+    if not bool(valid.any()):
+        return float("nan")
+    q = pred_jump.numel()
+    best_cost = None
+    for perm in itertools.permutations(range(q)):
+        candidate = pred_jump[list(perm)]
+        cost = (candidate[valid] - target_jump[valid]).abs().float().mean()
+        if best_cost is None or float(cost) < float(best_cost):
+            best_cost = cost
+    return float(best_cost.detach().cpu())
+
+
 @torch.no_grad()
 def evaluate_readiness(
     router_checkpoint: str | Path,
@@ -71,6 +92,8 @@ def evaluate_readiness(
     jump_aux_checkpoint: str | Path | None = None,
     candidate_policy: str = "guarded_special",
     candidate_special_boost: float = 0.12,
+    jump_location_temperature: float = 0.2,
+    jump_location_smooth_kernel: int = 15,
 ) -> dict:
     device = torch.device(
         "cuda"
@@ -222,22 +245,42 @@ def evaluate_readiness(
                             aux_stft_cfg.hop_length,
                         )
                         pred_jump = (
-                            jump_location_from_logits(aux_jump_logits).detach().cpu()
+                            jump_location_from_logits(
+                                aux_jump_logits,
+                                temperature=jump_location_temperature,
+                                smooth_kernel=jump_location_smooth_kernel,
+                            ).detach().cpu()
                             if aux_jump_logits is not None
                             else jump_location_from_if(aux_target_if).detach().cpu()
                         )
-                        target_jump = jump_location_from_if(aux_target_if).detach().cpu()
-                        frame_err = (pred_jump - target_jump).abs().float().mean().item()
-                        local_jump_ms.append(frame_err * aux_stft_cfg.hop_length / aux_sim_cfg.fs * 1000.0)
+                        if "jump_center" in batch and "jump_valid" in batch:
+                            target_jump = jump_location_from_centers(batch["jump_center"][sample_idx : sample_idx + 1], aux_jump_logits.shape[-1]).detach().cpu()
+                            valid_jump = batch["jump_valid"][sample_idx : sample_idx + 1].detach().cpu()
+                        else:
+                            target_jump = jump_location_from_if(aux_target_if).detach().cpu()
+                            valid_jump = None
+                        frame_err = best_event_frame_error(pred_jump[0], target_jump[0], None if valid_jump is None else valid_jump[0])
+                        if not np.isnan(frame_err):
+                            local_jump_ms.append(frame_err * aux_stft_cfg.hop_length / aux_sim_cfg.fs * 1000.0)
                     else:
                         pred_jump = (
-                            jump_location_from_logits(jump_logits).detach().cpu()
+                            jump_location_from_logits(
+                                jump_logits,
+                                temperature=jump_location_temperature,
+                                smooth_kernel=jump_location_smooth_kernel,
+                            ).detach().cpu()
                             if jump_logits is not None
                             else jump_location_from_if(pred_if).detach().cpu()
                         )
-                        target_jump = jump_location_from_if(target_if).detach().cpu()
-                        frame_err = (pred_jump - target_jump).abs().float().mean().item()
-                        local_jump_ms.append(frame_err * stft_cfg.hop_length / sim_cfg.fs * 1000.0)
+                        if "jump_center" in batch and "jump_valid" in batch:
+                            target_jump = jump_location_from_centers(batch["jump_center"][sample_idx : sample_idx + 1], jump_logits.shape[-1] if jump_logits is not None else pred_if.shape[-1]).detach().cpu()
+                            valid_jump = batch["jump_valid"][sample_idx : sample_idx + 1].detach().cpu()
+                        else:
+                            target_jump = jump_location_from_if(target_if).detach().cpu()
+                            valid_jump = None
+                        frame_err = best_event_frame_error(pred_jump[0], target_jump[0], None if valid_jump is None else valid_jump[0])
+                        if not np.isnan(frame_err):
+                            local_jump_ms.append(frame_err * stft_cfg.hop_length / sim_cfg.fs * 1000.0)
 
         scenario_result = {
             "if_mae_hz": float(np.mean(selected_maes)),
@@ -358,6 +401,8 @@ def main() -> None:
     parser.add_argument("--jump-aux-checkpoint", default=None, help="Optional IFNetJumpAux checkpoint used only for local-jump event timing.")
     parser.add_argument("--candidate-policy", choices=["router_topk", "guarded_special"], default="guarded_special")
     parser.add_argument("--candidate-special-boost", type=float, default=0.12)
+    parser.add_argument("--jump-location-temperature", type=float, default=0.2)
+    parser.add_argument("--jump-location-smooth-kernel", type=int, default=15)
     args = parser.parse_args()
 
     expert_paths = {
@@ -385,6 +430,8 @@ def main() -> None:
         jump_aux_checkpoint=args.jump_aux_checkpoint,
         candidate_policy=args.candidate_policy,
         candidate_special_boost=args.candidate_special_boost,
+        jump_location_temperature=args.jump_location_temperature,
+        jump_location_smooth_kernel=args.jump_location_smooth_kernel,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 

@@ -117,9 +117,11 @@ coverage, crossing identity continuity, and local-jump event timing:
   --quality-selector-checkpoint .\ifnet_stage1\runs\quality_selector_v1\latest.pt `
   --quality-selector-margin 0.10 `
   --quality-protect-top-routes cross_overlap_like `
-  --jump-aux-checkpoint .\ifnet_stage1\runs\local_jump_aux_v2\latest.pt `
+  --jump-aux-checkpoint .\ifnet_stage1\runs\local_jump_aux_v3\latest.pt `
   --candidate-policy guarded_special `
-  --candidate-special-boost 0.12
+  --candidate-special-boost 0.12 `
+  --jump-location-temperature 0.2 `
+  --jump-location-smooth-kernel 15
 ```
 
 The script writes `readiness_metrics.json` and returns `ready_for_stage2`.
@@ -141,21 +143,25 @@ expert remains responsible for the IF curve itself.
 
 ```powershell
 .\.venv_ifnet\Scripts\python.exe -m ifnet_stage1.train_jump_aux `
-  --config .\ifnet_stage1\configs\local_jump_aux.yaml
+  --config .\ifnet_stage1\configs\local_jump_aux_v3.yaml
 ```
 
-For now, use the auxiliary checkpoint through `--jump-aux-checkpoint` in the
-readiness evaluator instead of replacing the main jump expert.
+The v3 auxiliary head uses the simulator's true `jump_center` and `jump_valid`
+metadata for event supervision. Invalid or absent jump components are masked out
+of the event loss, and readiness uses a smoothed soft-argmax event readout.
+Use the auxiliary checkpoint through `--jump-aux-checkpoint` in the readiness
+evaluator instead of replacing the main jump expert.
 
 The current preferred combination is:
 
 - router: `ifnet_stage1/runs/router_hard_v3/latest.pt`;
 - quality selector: `ifnet_stage1/runs/quality_selector_v1/latest.pt`;
 - IF experts: existing poly/sinusoidal/cross/local-jump experts;
-- local-jump event head: `ifnet_stage1/runs/local_jump_aux_v2/latest.pt`;
+- local-jump event head: `ifnet_stage1/runs/local_jump_aux_v3/latest.pt`;
 - candidate export policy: `guarded_special`, boost `0.12`.
 
-With this combination, the `stage1_readiness_aux_v2_guarded_candidates`
-evaluation passed all readiness gates on seed `13579`. A second seed `67890`
-kept top-2 candidate coverage above the 88% gate; its sinusoidal-FM MAE
-fluctuation was resolved when rechecked with 512 sinusoidal samples.
+With this combination, `stage1_readiness_aux_v3_center_soft` passed all
+readiness gates on seed `13579`: average IF MAE `4.33 Hz`, top-2 candidate
+coverage `88.72%`, and local-jump event MAE `33.09 ms`. A second seed `67890`
+also passed with average IF MAE `4.24 Hz`, top-2 candidate coverage `88.72%`,
+and local-jump event MAE `38.09 ms`.

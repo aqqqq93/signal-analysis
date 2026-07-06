@@ -11,7 +11,14 @@ import torch
 from tqdm import trange
 
 from .config import choose_device, load_config
-from .jump_aux import IFNetJumpAux, jump_aux_config_from_dict, jump_nll_loss, make_jump_targets
+from .jump_aux import (
+    IFNetJumpAux,
+    jump_aux_config_from_dict,
+    jump_location_from_centers,
+    make_jump_center_targets,
+    make_jump_targets,
+    masked_jump_nll_loss,
+)
 from .losses import pairwise_ridge_nll, permutation_l1, permutation_slope_l1, second_difference_smoothness
 from .model import model_config_from_dict, soft_argmax_if
 from .simulation import ChirpSimulator, sim_config_from_dict
@@ -69,17 +76,26 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         ridge_logits, jump_logits = model(feats)
         target_if = sample_if_to_frames(batch["if_hz"], ridge_logits.shape[-1], stft_cfg.hop_length)
         pred_if, _ = soft_argmax_if(ridge_logits, freq_grid, model_cfg.temperature)
-        jump_target = make_jump_targets(
-            target_if,
-            sigma_frames=jump_cfg.jump_sigma_frames,
-            min_jump_hz=jump_cfg.min_jump_hz,
-        )
+        if "jump_center" in batch and "jump_valid" in batch:
+            jump_target, jump_valid = make_jump_center_targets(
+                batch["jump_center"],
+                batch["jump_valid"],
+                frames=jump_logits.shape[-1],
+                sigma_frames=jump_cfg.jump_sigma_frames,
+            )
+        else:
+            jump_target = make_jump_targets(
+                target_if,
+                sigma_frames=jump_cfg.jump_sigma_frames,
+                min_jump_hz=jump_cfg.min_jump_hz,
+            )
+            jump_valid = torch.ones(jump_logits.shape[:2], device=jump_logits.device, dtype=torch.bool)
 
         loss_nll = pairwise_ridge_nll(ridge_logits, target_if, freq_grid, ridge_sigma)
         loss_l1 = permutation_l1(pred_if, target_if)
         loss_slope = permutation_slope_l1(pred_if, target_if)
         loss_smooth = second_difference_smoothness(pred_if)
-        loss_jump = jump_nll_loss(jump_logits, jump_target)
+        loss_jump = masked_jump_nll_loss(jump_logits, jump_target, jump_valid)
         loss = (
             jump_cfg.ridge_weight * float(loss_weights.get("nll", 1.0)) * loss_nll
             + jump_cfg.ridge_weight * float(loss_weights.get("if_l1", 0.30)) * (loss_l1 / sim_cfg.fs)
@@ -131,9 +147,16 @@ def evaluate(model, simulator, stft_cfg, model_cfg, jump_cfg, fs: float, batch_s
         target_if = sample_if_to_frames(batch["if_hz"], ridge_logits.shape[-1], stft_cfg.hop_length)
         pred_if, _ = soft_argmax_if(ridge_logits, freq_grid, model_cfg.temperature)
         maes.append(permutation_l1(pred_if, target_if).detach())
-        target_jump = make_jump_targets(target_if, jump_cfg.jump_sigma_frames, jump_cfg.min_jump_hz).argmax(dim=-1)
+        if "jump_center" in batch and "jump_valid" in batch:
+            target_jump = jump_location_from_centers(batch["jump_center"], jump_logits.shape[-1])
+            jump_valid = batch["jump_valid"].to(dtype=torch.bool)
+        else:
+            target_jump = make_jump_targets(target_if, jump_cfg.jump_sigma_frames, jump_cfg.min_jump_hz).argmax(dim=-1)
+            jump_valid = torch.ones(jump_logits.shape[:2], device=jump_logits.device, dtype=torch.bool)
         pred_jump = jump_logits.argmax(dim=-1)
-        jump_frame_err.append((pred_jump - target_jump).abs().float().mean())
+        err = (pred_jump - target_jump).abs().float()
+        weights = jump_valid.to(dtype=err.dtype)
+        jump_frame_err.append((err * weights).sum() / weights.sum().clamp_min(1.0))
     return {
         "if_mae_hz": float(torch.stack(maes).mean().cpu()),
         "jump_frame_mae": float(torch.stack(jump_frame_err).mean().cpu()),

@@ -104,11 +104,53 @@ def make_jump_targets(target_if: torch.Tensor, sigma_frames: float = 2.5, min_ju
     return torch.where(has_jump, target, uniform)
 
 
+def make_jump_center_targets(
+    jump_center: torch.Tensor,
+    jump_valid: torch.Tensor,
+    frames: int,
+    sigma_frames: float = 2.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build soft temporal event labels from simulator jump-center metadata.
+
+    `jump_center` is normalized to [0, 1]. `jump_valid` marks components that
+    have a physical jump event; invalid components are masked out of the event
+    loss instead of being forced to learn an arbitrary strongest slope.
+    """
+
+    if jump_center.shape != jump_valid.shape:
+        raise ValueError(f"Jump center/valid shape mismatch: {tuple(jump_center.shape)} vs {tuple(jump_valid.shape)}")
+    if jump_center.ndim != 2:
+        raise ValueError(f"Expected jump_center [B,Q], got {tuple(jump_center.shape)}")
+    if frames < 1:
+        raise ValueError("frames must be positive")
+
+    center = jump_center.clamp(0.0, 1.0) * float(max(frames - 1, 1))
+    time = torch.arange(frames, device=jump_center.device, dtype=jump_center.dtype).view(1, 1, -1)
+    sigma = max(float(sigma_frames), 1.0e-3)
+    target = torch.exp(-0.5 * ((time - center.unsqueeze(-1)) / sigma).pow(2))
+    target = target / target.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    valid = jump_valid.to(dtype=torch.bool)
+    uniform = jump_center.new_full((*jump_center.shape, frames), 1.0 / frames)
+    return torch.where(valid.unsqueeze(-1), target, uniform), valid
+
+
 def jump_nll_loss(jump_logits: torch.Tensor, jump_target: torch.Tensor) -> torch.Tensor:
     if jump_logits.shape != jump_target.shape:
         raise ValueError(f"Jump logits/target shape mismatch: {tuple(jump_logits.shape)} vs {tuple(jump_target.shape)}")
     log_probs = F.log_softmax(jump_logits, dim=-1)
     return -(jump_target * log_probs).sum(dim=-1).mean()
+
+
+def masked_jump_nll_loss(jump_logits: torch.Tensor, jump_target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    if jump_logits.shape != jump_target.shape:
+        raise ValueError(f"Jump logits/target shape mismatch: {tuple(jump_logits.shape)} vs {tuple(jump_target.shape)}")
+    if valid_mask.shape != jump_logits.shape[:2]:
+        raise ValueError(f"Jump valid mask shape mismatch: {tuple(valid_mask.shape)} vs {tuple(jump_logits.shape[:2])}")
+    log_probs = F.log_softmax(jump_logits, dim=-1)
+    per_component = -(jump_target * log_probs).sum(dim=-1)
+    weights = valid_mask.to(dtype=per_component.dtype)
+    denom = weights.sum().clamp_min(1.0)
+    return (per_component * weights).sum() / denom
 
 
 @torch.no_grad()
@@ -120,5 +162,26 @@ def jump_location_from_if(pred_if: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def jump_location_from_logits(jump_logits: torch.Tensor) -> torch.Tensor:
-    return jump_logits.argmax(dim=-1)
+def jump_location_from_centers(jump_center: torch.Tensor, frames: int) -> torch.Tensor:
+    return (jump_center.clamp(0.0, 1.0) * float(max(frames - 1, 1))).round().long()
+
+
+@torch.no_grad()
+def jump_location_from_logits(
+    jump_logits: torch.Tensor,
+    *,
+    temperature: float = 0.0,
+    smooth_kernel: int = 1,
+) -> torch.Tensor:
+    logits = jump_logits
+    if smooth_kernel > 1:
+        kernel = int(smooth_kernel)
+        if kernel % 2 == 0:
+            kernel += 1
+        weight = logits.new_ones(1, 1, kernel) / float(kernel)
+        logits = F.conv1d(logits.reshape(-1, 1, logits.shape[-1]), weight, padding=kernel // 2).reshape_as(logits)
+    if temperature <= 0.0:
+        return logits.argmax(dim=-1)
+    time = torch.arange(logits.shape[-1], device=logits.device, dtype=logits.dtype)
+    probs = torch.softmax(logits / float(temperature), dim=-1)
+    return (probs * time).sum(dim=-1)

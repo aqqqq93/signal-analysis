@@ -70,6 +70,8 @@ class ChirpSimulator:
         components = []
         if_curves = []
         amp_curves = []
+        jump_centers = []
+        jump_valid = []
         scenario_out: list[str] = []
         noise_out: list[str] = []
 
@@ -79,6 +81,7 @@ class ChirpSimulator:
             )
             noise_name = self._choice(self.noise_names, self.noise_probs)
             if_hz = self._make_if_curves(scenario)
+            metadata = getattr(self, "_last_metadata", {})
             amps = self._make_amplitudes()
             comps = self._render_components(if_hz, amps)
             clean_sig = comps.sum(dim=0)
@@ -90,6 +93,8 @@ class ChirpSimulator:
             components.append(comps / scale)
             if_curves.append(if_hz)
             amp_curves.append(amps / scale)
+            jump_centers.append(self._metadata_vector(metadata, "jump_center", float("nan"), torch.float32))
+            jump_valid.append(self._metadata_vector(metadata, "jump_valid", False, torch.bool))
             scenario_out.append(scenario)
             noise_out.append(noise_name)
 
@@ -100,6 +105,8 @@ class ChirpSimulator:
             "components": torch.stack(components).to(target_device),
             "if_hz": torch.stack(if_curves).to(target_device),
             "amplitude": torch.stack(amp_curves).to(target_device),
+            "jump_center": torch.stack(jump_centers).to(target_device),
+            "jump_valid": torch.stack(jump_valid).to(target_device),
             "scenario": scenario_out,
             "noise_type": noise_out,
         }
@@ -108,7 +115,13 @@ class ChirpSimulator:
         maker = getattr(self, f"_scenario_{scenario}", None)
         if maker is None:
             raise ValueError(f"Unknown scenario: {scenario}")
-        curves = maker()
+        result = maker()
+        if isinstance(result, tuple):
+            curves, metadata = result
+            self._last_metadata = metadata
+        else:
+            curves = result
+            self._last_metadata = {}
         if curves.shape[0] < self.cfg.num_components:
             repeats = self.cfg.num_components - curves.shape[0]
             curves = torch.cat([curves, curves[-1:].repeat(repeats, 1)], dim=0)
@@ -190,6 +203,9 @@ class ChirpSimulator:
     def _scenario_local_jump(self) -> torch.Tensor:
         params = self._scenario_params("local_jump")
         curves = []
+        centers = []
+        valid = []
+        jumps = []
         for i in range(self.cfg.num_components):
             base = self._rand(80.0 + 75.0 * i, 155.0 + 75.0 * i)
             slope = self._rand_range(params, "slope_hz", -60.0, 70.0)
@@ -204,7 +220,15 @@ class ChirpSimulator:
                 -0.5 * ((self.u - center) / bump_width).pow(2)
             )
             curves.append(base + slope * self.u + jump * step + local_bump)
-        return torch.stack(curves)
+            centers.append(center)
+            jumps.append(jump)
+            valid.append(abs(float(jump)) >= float(params.get("jump_abs_min_hz", 1.0)))
+        metadata = {
+            "jump_center": torch.tensor(centers, dtype=torch.float32),
+            "jump_valid": torch.tensor(valid, dtype=torch.bool),
+            "jump_hz": torch.tensor(jumps, dtype=torch.float32),
+        }
+        return torch.stack(curves), metadata
 
     def _scenario_tangent_or_overlap(self) -> torch.Tensor:
         if self._rand(0.0, 1.0) < 0.5:
@@ -341,6 +365,20 @@ class ChirpSimulator:
         sign = -1.0 if self._rand(0.0, 1.0) < 0.5 else 1.0
         upper = max(abs(float(low)), abs(float(high)), min_abs)
         return sign * self._rand(min_abs, upper)
+
+    def _metadata_vector(self, metadata: dict, key: str, default: float | bool, dtype: torch.dtype) -> torch.Tensor:
+        value = metadata.get(key)
+        if value is None:
+            tensor = torch.full((self.cfg.num_components,), default, dtype=dtype)
+        else:
+            tensor = torch.as_tensor(value, dtype=dtype)
+            if tensor.ndim == 0:
+                tensor = tensor.view(1)
+            if tensor.numel() < self.cfg.num_components:
+                pad = torch.full((self.cfg.num_components - tensor.numel(),), default, dtype=dtype)
+                tensor = torch.cat([tensor, pad], dim=0)
+            tensor = tensor[: self.cfg.num_components]
+        return tensor
 
 
 def sim_config_from_dict(data: dict) -> SimConfig:
