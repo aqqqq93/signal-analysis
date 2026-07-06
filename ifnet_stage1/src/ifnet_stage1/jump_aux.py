@@ -72,7 +72,7 @@ class IFNetJumpAux(nn.Module):
             h = dec(h)
 
         ridge_logits = self.ridge_head(h)
-        jump_logits = self.jump_head(h).mean(dim=2)
+        jump_logits = self.jump_head(h).amax(dim=2)
         return ridge_logits, jump_logits
 
 

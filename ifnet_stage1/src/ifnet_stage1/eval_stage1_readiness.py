@@ -15,7 +15,7 @@ from .postprocess import apply_if_postprocess
 from .predict_routed import DEFAULT_EXPERTS, DEFAULT_POSTPROCESS, load_expert, load_quality_selector
 from .quality_selector import select_candidate_with_quality
 from .router import DEFAULT_SCENARIO_TO_ROUTE, ROUTE_NAMES, HardRouteClassifier, router_config_from_dict, scenario_to_route_labels
-from .routing_policy import candidate_route_indices, select_best_candidate
+from .routing_policy import candidate_route_indices, export_candidate_indices, select_best_candidate
 from .simulation import ChirpSimulator, SCENARIOS, sim_config_from_dict
 from .tf import feature_channels, log_spectrogram, sample_if_to_frames, stft_config_from_dict
 
@@ -69,6 +69,8 @@ def evaluate_readiness(
     quality_protect_top_routes: set[str],
     confidence_threshold: float,
     jump_aux_checkpoint: str | Path | None = None,
+    candidate_policy: str = "guarded_special",
+    candidate_special_boost: float = 0.12,
 ) -> dict:
     device = torch.device(
         "cuda"
@@ -130,10 +132,13 @@ def evaluate_readiness(
                     margin_threshold=fallback_margin,
                     topk=fallback_topk,
                 )
-                export_indices = [
-                    int(item.detach().cpu())
-                    for item in torch.topk(route_probs[sample_idx], k=min(fallback_topk, route_probs.shape[1])).indices
-                ]
+                export_indices = export_candidate_indices(
+                    route_probs[sample_idx],
+                    route_names,
+                    topk=fallback_topk,
+                    policy=candidate_policy,
+                    special_boost=candidate_special_boost,
+                )
                 candidate_indices = []
                 for idx in selection_indices + export_indices:
                     if idx not in candidate_indices:
@@ -188,7 +193,11 @@ def evaluate_readiness(
                 pred_if, target_if, ridge_probs, jump_logits = outputs[selected_name]
                 selected_mae = best_mae(pred_if[0].detach().cpu(), target_if[0].detach().cpu())
                 fixed_mae = float((pred_if[0].detach().cpu() - target_if[0].detach().cpu()).abs().mean())
-                oracle_mae = min(best_mae(outputs[name][0][0].detach().cpu(), outputs[name][1][0].detach().cpu()) for _idx, name, _pred, _probs in candidates)
+                oracle_mae = min(
+                    best_mae(outputs[name][0][0].detach().cpu(), outputs[name][1][0].detach().cpu())
+                    for _idx, name, _pred, _probs in candidates
+                    if _idx in export_indices
+                )
                 confidence = combined_initial_confidence(route_probs[sample_idx], ridge_probs)
 
                 selected_maes.append(selected_mae)
@@ -347,6 +356,8 @@ def main() -> None:
     parser.add_argument("--quality-protect-top-routes", nargs="*", default=["cross_overlap_like"])
     parser.add_argument("--confidence-threshold", type=float, default=0.62)
     parser.add_argument("--jump-aux-checkpoint", default=None, help="Optional IFNetJumpAux checkpoint used only for local-jump event timing.")
+    parser.add_argument("--candidate-policy", choices=["router_topk", "guarded_special"], default="guarded_special")
+    parser.add_argument("--candidate-special-boost", type=float, default=0.12)
     args = parser.parse_args()
 
     expert_paths = {
@@ -372,6 +383,8 @@ def main() -> None:
         quality_protect_top_routes=set(args.quality_protect_top_routes),
         confidence_threshold=args.confidence_threshold,
         jump_aux_checkpoint=args.jump_aux_checkpoint,
+        candidate_policy=args.candidate_policy,
+        candidate_special_boost=args.candidate_special_boost,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 

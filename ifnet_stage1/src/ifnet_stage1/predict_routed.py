@@ -18,7 +18,7 @@ from .quality_selector import (
     select_candidate_with_quality,
 )
 from .router import ROUTE_NAMES, HardRouteClassifier, router_config_from_dict
-from .routing_policy import candidate_route_indices, select_best_candidate
+from .routing_policy import candidate_route_indices, export_candidate_indices, select_best_candidate
 from .simulation import sim_config_from_dict
 from .tf import feature_channels, log_spectrogram, stft_config_from_dict
 
@@ -62,6 +62,8 @@ def main() -> None:
     parser.add_argument("--quality-protect-top-routes", nargs="*", default=[])
     parser.add_argument("--quality-protect-min-prob", type=float, default=0.0)
     parser.add_argument("--export-candidates-topk", type=int, default=2, help="Store this many expert IF candidates in the output.")
+    parser.add_argument("--export-candidate-policy", choices=["router_topk", "guarded_special"], default="guarded_special")
+    parser.add_argument("--export-special-boost", type=float, default=0.12)
     args = parser.parse_args()
 
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device))
@@ -123,10 +125,13 @@ def main() -> None:
         if not args.fallback:
             fallback_indices, used_fallback = [int(route_idx[sample_idx].detach().cpu())], False
         export_topk = max(1, int(args.export_candidates_topk))
-        export_indices = [
-            int(item.detach().cpu())
-            for item in torch.topk(route_probs[sample_idx], k=min(export_topk, route_probs.shape[1])).indices
-        ]
+        export_indices = export_candidate_indices(
+            route_probs[sample_idx],
+            route_names,
+            topk=export_topk,
+            policy=args.export_candidate_policy,
+            special_boost=args.export_special_boost,
+        )
         candidate_indices = []
         for idx in fallback_indices + export_indices:
             if idx not in candidate_indices:

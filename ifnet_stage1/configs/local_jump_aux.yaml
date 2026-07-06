@@ -49,8 +49,8 @@ model:
 
 jump_aux:
   ridge_weight: 1.0
-  jump_weight: 1.0
-  jump_sigma_frames: 2.5
+  jump_weight: 1.4
+  jump_sigma_frames: 1.8
   min_jump_hz: 1.0
 
 train:

@@ -117,7 +117,9 @@ coverage, crossing identity continuity, and local-jump event timing:
   --quality-selector-checkpoint .\ifnet_stage1\runs\quality_selector_v1\latest.pt `
   --quality-selector-margin 0.10 `
   --quality-protect-top-routes cross_overlap_like `
-  --jump-aux-checkpoint .\ifnet_stage1\runs\local_jump_aux_v1\latest.pt
+  --jump-aux-checkpoint .\ifnet_stage1\runs\local_jump_aux_v2\latest.pt `
+  --candidate-policy guarded_special `
+  --candidate-special-boost 0.12
 ```
 
 The script writes `readiness_metrics.json` and returns `ready_for_stage2`.
@@ -144,3 +146,16 @@ expert remains responsible for the IF curve itself.
 
 For now, use the auxiliary checkpoint through `--jump-aux-checkpoint` in the
 readiness evaluator instead of replacing the main jump expert.
+
+The current preferred combination is:
+
+- router: `ifnet_stage1/runs/router_hard_v3/latest.pt`;
+- quality selector: `ifnet_stage1/runs/quality_selector_v1/latest.pt`;
+- IF experts: existing poly/sinusoidal/cross/local-jump experts;
+- local-jump event head: `ifnet_stage1/runs/local_jump_aux_v2/latest.pt`;
+- candidate export policy: `guarded_special`, boost `0.12`.
+
+With this combination, the `stage1_readiness_aux_v2_guarded_candidates`
+evaluation passed all readiness gates on seed `13579`. A second seed `67890`
+kept top-2 candidate coverage above the 88% gate; its sinusoidal-FM MAE
+fluctuation was resolved when rechecked with 512 sinusoidal samples.

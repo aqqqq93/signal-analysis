@@ -22,6 +22,47 @@ def candidate_route_indices(
     return [int(item.detach().cpu()) for item in indices], True
 
 
+def export_candidate_indices(
+    route_probs: torch.Tensor,
+    route_names: tuple[str, ...],
+    topk: int = 2,
+    policy: str = "router_topk",
+    special_routes: tuple[str, ...] = ("sinusoidal_like", "jump_like"),
+    special_boost: float = 0.12,
+) -> list[int]:
+    """Return the candidate routes exported for downstream initialization.
+
+    `router_topk` is the literal top-k router probabilities. `guarded_special`
+    keeps the top-1 route fixed, then lets under-covered special routes compete
+    for the second slot with a small prior boost. This improves candidate
+    coverage for sinusoidal/local-jump cases while preserving a two-candidate
+    interface for Stage 2.
+    """
+
+    if route_probs.ndim != 1:
+        raise ValueError(f"Expected route_probs [R], got {tuple(route_probs.shape)}")
+    k = min(max(1, int(topk)), route_probs.numel())
+    if policy == "router_topk" or k == 1:
+        return [int(item.detach().cpu()) for item in torch.topk(route_probs, k=k).indices]
+    if policy != "guarded_special":
+        raise ValueError(f"Unknown candidate export policy: {policy}")
+
+    top1 = int(route_probs.argmax().detach().cpu())
+    selected = [top1]
+    scores = route_probs.clone()
+    scores[top1] = -torch.inf
+    for route_name in special_routes:
+        if route_name in route_names:
+            idx = route_names.index(route_name)
+            if idx != top1:
+                scores[idx] = scores[idx] + float(special_boost)
+    while len(selected) < k:
+        next_idx = int(scores.argmax().detach().cpu())
+        selected.append(next_idx)
+        scores[next_idx] = -torch.inf
+    return selected
+
+
 def select_best_candidate(
     route_probs: torch.Tensor,
     candidates: list[tuple[int, str, torch.Tensor, torch.Tensor]],

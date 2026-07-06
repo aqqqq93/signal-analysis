@@ -24,6 +24,13 @@ Stage 1 is the active implementation. It contains:
 - evaluation and prediction scripts;
 - PDF summary generation script.
 
+Current preferred Stage-1 handoff combination:
+
+- `router_hard_v3`;
+- `quality_selector_v1`;
+- guarded-special top-2 candidate export;
+- `local_jump_aux_v2` for local-jump event timing.
+
 Large training outputs and model checkpoints under `ifnet_stage1/runs/` are intentionally ignored. If trained weights need to be shared later, use Git LFS or GitHub Releases rather than committing them directly.
 
 ## Development
