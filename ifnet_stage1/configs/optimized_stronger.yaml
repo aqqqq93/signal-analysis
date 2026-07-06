@@ -1,0 +1,54 @@
+seed: 20260705
+device: auto
+run_dir: ifnet_stage1/runs/optimized_stronger
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -10.0
+  snr_db_max: 20.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 1.0
+    crossing: 1.0
+    near_parallel: 1.0
+    local_jump: 1.0
+    tangent_or_overlap: 1.0
+  noise_types:
+    white: 0.55
+    colored: 0.25
+    impulsive: 0.12
+    trend: 0.08
+
+stft:
+  n_fft: 256
+  hop_length: 4
+  win_length: 128
+  log_eps: 1.0e-6
+
+model:
+  base_channels: 24
+  depth: 3
+  dropout: 0.05
+  temperature: 0.08
+
+train:
+  steps: 600
+  batch_size: 16
+  lr: 0.0001
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 300
+  val_batches: 8
+  ridge_sigma_hz: 6.0
+  loss:
+    nll: 1.0
+    if_l1: 0.25
+    smooth: 0.05
+    identity_slope: 0.20

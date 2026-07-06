@@ -1,0 +1,69 @@
+seed: 20260705
+device: auto
+run_dir: ifnet_stage1/runs/router_hard
+
+route_names:
+  - poly_like
+  - sinusoidal_like
+  - cross_overlap_like
+  - jump_like
+
+scenario_to_route:
+  linear: poly_like
+  quadratic: poly_like
+  cubic: poly_like
+  sinusoidal_fm: sinusoidal_like
+  crossing: cross_overlap_like
+  near_parallel: cross_overlap_like
+  tangent_or_overlap: cross_overlap_like
+  local_jump: jump_like
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -10.0
+  snr_db_max: 22.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 3.0
+    crossing: 1.0
+    near_parallel: 1.0
+    tangent_or_overlap: 1.0
+    local_jump: 3.0
+  noise_types:
+    white: 0.52
+    colored: 0.25
+    impulsive: 0.13
+    trend: 0.10
+
+stft:
+  hop_length: 4
+  target_n_fft: 256
+  log_eps: 1.0e-6
+  scales:
+    - n_fft: 128
+      win_length: 64
+    - n_fft: 256
+      win_length: 128
+    - n_fft: 512
+      win_length: 256
+
+router:
+  base_channels: 16
+  depth: 3
+  dropout: 0.10
+
+train:
+  steps: 1200
+  batch_size: 32
+  lr: 0.0005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 300
+  val_batches: 8

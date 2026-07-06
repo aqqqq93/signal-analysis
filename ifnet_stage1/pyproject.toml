@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifnet-stage1"
+version = "0.1.0"
+description = "Stage-1 IF-Net for ICCD: differentiable time-frequency ridge estimation on simulated chirp signals."
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.0",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "matplotlib>=3.7",
+  "tqdm>=4.66",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+ifnet-train = "ifnet_stage1.train:main"
+ifnet-smoke = "ifnet_stage1.smoke_test:main"
+ifnet-train-router = "ifnet_stage1.train_router:main"
+ifnet-eval-router = "ifnet_stage1.eval_router:main"
+ifnet-eval-routed = "ifnet_stage1.eval_routed_scenarios:main"
+ifnet-predict-routed = "ifnet_stage1.predict_routed:main"
+ifnet-train-quality-selector = "ifnet_stage1.train_quality_selector:main"
+ifnet-eval-quality-selector = "ifnet_stage1.eval_quality_selector:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

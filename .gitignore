@@ -1,0 +1,51 @@
+# Keep this repository focused on the ICCD three-stage codebase.
+# Most files in the workspace are source papers, generated artifacts, or local runtime data.
+
+/*
+
+!.gitignore
+!README.md
+!.gitattributes
+!ifnet_stage1/
+!stage2_iccd/
+!stage3_pipeline/
+!docs/
+!output/
+
+# Stage 1 code is tracked; generated runs and binary model artifacts are not.
+ifnet_stage1/runs/
+ifnet_stage1/**/*.pt
+ifnet_stage1/**/*.pth
+ifnet_stage1/**/*.ckpt
+ifnet_stage1/**/*.npy
+ifnet_stage1/**/*.npz
+ifnet_stage1/**/*.mat
+ifnet_stage1/**/__pycache__/
+ifnet_stage1/**/*.pyc
+ifnet_stage1/src/*.egg-info/
+
+# Keep the current technical summary PDF, but ignore other generated outputs by default.
+output/*
+!output/pdf/
+output/pdf/*
+!output/pdf/ifnet_stage1_summary.pdf
+
+# Local environments and temporary files.
+.venv*/
+venv/
+env/
+tmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large or generated media.
+*.mp4
+*.avi
+*.mov
+*.wav
+*.flac
+*.zip
+*.7z
+*.tar
+*.gz

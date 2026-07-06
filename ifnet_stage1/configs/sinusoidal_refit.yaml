@@ -1,0 +1,63 @@
+seed: 20260705
+device: auto
+run_dir: ifnet_stage1/runs/sinusoidal_refit
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -8.0
+  snr_db_max: 24.0
+  scenario_weights:
+    linear: 0.0
+    quadratic: 0.0
+    cubic: 0.0
+    sinusoidal_fm: 1.0
+    crossing: 0.0
+    near_parallel: 0.0
+    local_jump: 0.0
+    tangent_or_overlap: 0.0
+  scenario_params:
+    sinusoidal_fm:
+      depth_hz: [22.0, 82.0]
+      rate_cycles: [0.45, 3.2]
+      trend_hz: [-45.0, 45.0]
+      second_harmonic_prob: 0.35
+      second_harmonic_depth_hz: [6.0, 28.0]
+      second_harmonic_rate_scale: [1.6, 2.5]
+  noise_types:
+    white: 0.50
+    colored: 0.25
+    impulsive: 0.15
+    trend: 0.10
+
+stft:
+  n_fft: 256
+  hop_length: 4
+  win_length: 128
+  log_eps: 1.0e-6
+
+model:
+  base_channels: 24
+  depth: 3
+  dropout: 0.05
+  temperature: 0.08
+
+train:
+  steps: 1200
+  batch_size: 16
+  lr: 0.00007
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 300
+  val_batches: 8
+  ridge_sigma_hz: 6.0
+  resume: ifnet_stage1/runs/optimized_identity_1500/latest.pt
+  loss:
+    nll: 1.0
+    if_l1: 0.32
+    smooth: 0.018
+    identity_slope: 0.14

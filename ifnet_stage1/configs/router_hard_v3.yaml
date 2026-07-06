@@ -1,0 +1,87 @@
+seed: 20260705
+device: auto
+run_dir: ifnet_stage1/runs/router_hard_v3
+
+route_names:
+  - poly_like
+  - sinusoidal_like
+  - cross_overlap_like
+  - jump_like
+
+scenario_to_route:
+  linear: poly_like
+  quadratic: poly_like
+  cubic: poly_like
+  sinusoidal_fm: sinusoidal_like
+  crossing: cross_overlap_like
+  near_parallel: cross_overlap_like
+  tangent_or_overlap: cross_overlap_like
+  local_jump: jump_like
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -8.0
+  snr_db_max: 24.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 5.0
+    crossing: 1.2
+    near_parallel: 2.0
+    tangent_or_overlap: 4.0
+    local_jump: 4.5
+  scenario_params:
+    sinusoidal_fm:
+      depth_hz: [22.0, 82.0]
+      rate_cycles: [0.45, 3.2]
+      trend_hz: [-45.0, 45.0]
+      second_harmonic_prob: 0.35
+      second_harmonic_depth_hz: [6.0, 28.0]
+      second_harmonic_rate_scale: [1.6, 2.5]
+    local_jump:
+      slope_hz: [-75.0, 85.0]
+      jump_hz: [-130.0, 130.0]
+      center: [0.18, 0.82]
+      width: [0.004, 0.040]
+      bump_hz: [-55.0, 55.0]
+      bump_width: [0.020, 0.075]
+      component_jump_prob: 0.75
+  noise_types:
+    white: 0.50
+    colored: 0.25
+    impulsive: 0.15
+    trend: 0.10
+
+stft:
+  hop_length: 4
+  target_n_fft: 256
+  log_eps: 1.0e-6
+  scales:
+    - n_fft: 128
+      win_length: 64
+    - n_fft: 256
+      win_length: 128
+    - n_fft: 512
+      win_length: 256
+
+router:
+  base_channels: 24
+  depth: 3
+  dropout: 0.08
+  use_aux_features: true
+  aux_hidden: 32
+
+train:
+  steps: 2000
+  batch_size: 32
+  lr: 0.00035
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 400
+  val_batches: 8

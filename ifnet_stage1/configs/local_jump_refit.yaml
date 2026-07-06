@@ -1,0 +1,65 @@
+seed: 20260705
+device: auto
+run_dir: ifnet_stage1/runs/local_jump_refit
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -8.0
+  snr_db_max: 24.0
+  scenario_weights:
+    linear: 0.0
+    quadratic: 0.0
+    cubic: 0.0
+    sinusoidal_fm: 0.0
+    crossing: 0.0
+    near_parallel: 0.0
+    local_jump: 1.0
+    tangent_or_overlap: 0.0
+  scenario_params:
+    local_jump:
+      slope_hz: [-75.0, 85.0]
+      jump_hz: [-145.0, 145.0]
+      jump_abs_min_hz: 35.0
+      center: [0.16, 0.84]
+      width: [0.0035, 0.038]
+      bump_hz: [-45.0, 45.0]
+      bump_width: [0.018, 0.070]
+      component_jump_prob: 0.90
+  noise_types:
+    white: 0.50
+    colored: 0.25
+    impulsive: 0.15
+    trend: 0.10
+
+stft:
+  n_fft: 256
+  hop_length: 4
+  win_length: 128
+  log_eps: 1.0e-6
+
+model:
+  base_channels: 24
+  depth: 3
+  dropout: 0.05
+  temperature: 0.08
+
+train:
+  steps: 1200
+  batch_size: 16
+  lr: 0.00007
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 300
+  val_batches: 8
+  ridge_sigma_hz: 6.0
+  resume: ifnet_stage1/runs/balanced_refit_resume/latest.pt
+  loss:
+    nll: 1.0
+    if_l1: 0.32
+    smooth: 0.004
+    identity_slope: 0.16
