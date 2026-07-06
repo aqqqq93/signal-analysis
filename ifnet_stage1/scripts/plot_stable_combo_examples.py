@@ -15,6 +15,7 @@ import torch
 from ifnet_stage1.model import IFNetUNet, model_config_from_dict, soft_argmax_if
 from ifnet_stage1.postprocess import apply_if_postprocess
 from ifnet_stage1.predict_routed import DEFAULT_EXPERTS, DEFAULT_POSTPROCESS
+from ifnet_stage1.quality_selector import select_candidate_with_quality
 from ifnet_stage1.router import (
     DEFAULT_SCENARIO_TO_ROUTE,
     ROUTE_NAMES,
@@ -65,6 +66,14 @@ def load_router(path: str | Path, device: torch.device):
     return router, sim_cfg, stft_cfg, route_names, scenario_to_route
 
 
+def load_quality_selector(path: str | Path | None, device: torch.device):
+    if path is None:
+        return None
+    from ifnet_stage1.predict_routed import load_quality_selector as _load_quality_selector
+
+    return _load_quality_selector(path, device)
+
+
 @torch.no_grad()
 def process_examples(args: argparse.Namespace) -> dict:
     device = torch.device(
@@ -74,6 +83,7 @@ def process_examples(args: argparse.Namespace) -> dict:
     )
     router, router_sim_cfg, router_stft_cfg, route_names, scenario_to_route = load_router(args.router_checkpoint, device)
     experts = {name: load_expert(path, device) for name, path in DEFAULT_EXPERTS.items() if name in route_names}
+    quality_selector = load_quality_selector(args.quality_selector_checkpoint, device)
     simulator = ChirpSimulator(router_sim_cfg, seed=args.seed)
 
     out_dir = Path(args.output_dir)
@@ -125,7 +135,17 @@ def process_examples(args: argparse.Namespace) -> dict:
             }
             candidates.append((candidate_idx, route_name, pred_if, probs))
 
-        selected_idx, selected_name = select_best_candidate(route_probs, candidates) if used_fallback else candidates[0][:2]
+        if used_fallback and quality_selector is not None:
+            selected_idx, selected_name = select_candidate_with_quality(
+                quality_selector,
+                route_probs,
+                candidates,
+                route_names,
+                margin=args.quality_selector_margin,
+                protect_top_routes=set(args.quality_protect_top_routes),
+            )
+        else:
+            selected_idx, selected_name = select_best_candidate(route_probs, candidates) if used_fallback else candidates[0][:2]
         selected = outputs[selected_name]
         pred = selected["pred_if"][0].detach().cpu()
         target = selected["target_if"][0].detach().cpu()
@@ -295,6 +315,9 @@ def main() -> None:
     parser.add_argument("--fallback-confidence", type=float, default=0.78)
     parser.add_argument("--fallback-margin", type=float, default=0.18)
     parser.add_argument("--fallback-topk", type=int, default=2)
+    parser.add_argument("--quality-selector-checkpoint", default="ifnet_stage1/runs/quality_selector_v1/latest.pt")
+    parser.add_argument("--quality-selector-margin", type=float, default=0.10)
+    parser.add_argument("--quality-protect-top-routes", nargs="*", default=["cross_overlap_like"])
     args = parser.parse_args()
 
     unknown = sorted(set(args.scenarios) - set(SCENARIOS))

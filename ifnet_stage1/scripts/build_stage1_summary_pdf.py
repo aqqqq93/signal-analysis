@@ -282,19 +282,46 @@ def build_pdf() -> Path:
     story.append(p("ICCD 第一阶段 IF-Net 技术总结", styles["title"]))
     story.append(p("从传统时频脊线提取到可微 IF 网络、专家模型、路由器与二级质量判别器", styles["subtitle"]))
 
+    story.append(p("阅读说明", styles["h1"]))
+    story.append(
+        p(
+            "这份文档总结的是 ICCD 任务的第一阶段：先从混合信号中估计每个分量的瞬时频率 IF。"
+            "IF 可以理解为“每条分量曲线在每个时刻对应的频率轨迹”。后续第二阶段会基于这些 IF 初值继续做 ICCD 参数估计和重构，因此第一阶段追求的是可靠、可解释、带置信度的初始估计，而不是把每个像素都完全贴合真实脊线。",
+            styles["body"],
+        )
+    )
+    add_bullets(
+        story,
+        [
+            "图中绿色线是真实 IF，蓝色虚线是模型预测 IF；两者越接近，说明第一阶段给出的初值越好。",
+            "MAE 是平均绝对误差，单位为 Hz；P95 表示 95% 样本误差不超过该值，用来观察长尾难例。",
+            "top-2 候选覆盖率表示：如果第二阶段可以同时保留两个候选专家输出，其中至少一个候选在 10 Hz 内的比例。",
+            "ready_for_stage2=True 不是说第一阶段已经完美，而是说它已经足够作为第二阶段优化的起点。第二阶段仍应利用置信度和候选分支继续修正难例。",
+        ],
+        styles["body"],
+    )
+
     story.append(p("一、第一阶段目标与总体路线", styles["h1"]))
     story.append(
         p(
-            "第一阶段的目标是把 ICCD 中依赖时频图和脊线搜索的 IF 提取步骤，转化为可训练、可微分、可批量验证的神经网络模块。"
-            "当前方案保留“时频表示 -> 脊线 -> IF”的物理含义，但把脊线搜索替换为 IF-Net 的 heatmap 预测：网络学习每个分量在每个时刻的频率概率分布，再用 soft-argmax 输出连续 IF 曲线。",
+            "传统做法通常先计算 STFT 之类的时频图，再在图上寻找能量最强的脊线，把脊线当作 IF。"
+            "这个思路物理意义清楚，但在交叉、近并行、局部跳变、噪声较强时，手工脊线搜索容易断裂、跳错分量或跟随错误能量峰。"
+            "第一阶段的目标，就是把这个“看图找脊线”的步骤改造成可训练、可微分、可批量验证的神经网络模块。",
             styles["body"],
         )
     )
     story.append(
         p(
-            "当前推荐组合为 router_hard_v3 + 四个 IF-Net 专家 + guarded top-2 fallback + 二级质量判别器。"
-            "路由器先给出候选专家，低置信时运行 top-2 专家；质量判别器再判断哪个专家的 IF 输出更可靠。"
-            "为避免误伤 crossing，若 top-1 为 cross_overlap_like，则默认保护该输出。",
+            "当前方案保留“时频表示 -> 脊线 -> IF”的物理含义，但不再用固定规则硬找一条脊线。IF-Net 会先输出 ridge heatmap，也就是每个时刻、每个频率点属于目标 IF 的概率；然后用 soft-argmax 把概率图转成连续 IF 曲线。"
+            "这样做的好处是：模型可以从大量仿真样本中学习复杂脊线形态，同时输出仍然能解释为一条时频脊线。",
+            styles["body"],
+        )
+    )
+    story.append(
+        p(
+            "当前推荐组合为 router_hard_v3 + 四个 IF-Net 专家 + guarded top-2 fallback + 二级质量判别器 + local_jump_aux_v3。"
+            "路由器先判断信号更像哪类场景，再送入对应专家；当路由器不够确定时，系统保留两个候选专家输出；质量判别器用于在候选之间选择更可靠的 IF。"
+            "对 crossing 类样本额外加入保护，因为交叉处容易发生分量身份误判，贸然覆盖 top-1 反而可能变差。",
             styles["body"],
         )
     )
@@ -307,6 +334,8 @@ def build_pdf() -> Path:
             "覆盖类型：线性 chirp、二次/三次多项式 chirp、正弦调频 chirp、交叉 IF、接近平行 IF、局部突变 IF、相切或短时间重合 IF。",
             "噪声类型：白噪声、colored 噪声、脉冲噪声、趋势项噪声；训练时随机 SNR 覆盖约 -10 dB 到 24 dB。",
             "监督标签：仿真器输出真实 IF 曲线，训练时采样到 STFT 帧中心，并在频率轴生成 ridge heatmap 标签。",
+            "为什么用仿真数据：真实信号通常很难逐时刻标注真实 IF，而仿真器可以同时生成混合信号、真实分量、真实 IF 和局部跳变位置。这样可以先把第一阶段训练成稳定的初始估计器，再在第二阶段接入更贴近实际任务的数据。",
+            "local_jump 的 v3 辅助头额外使用 jump_center 和 jump_valid：前者表示真实跳变中心位置，后者表示该分量是否真的有跳变。这样模型不会被迫在无跳变或弱跳变分量上寻找一个不存在的事件。",
         ],
         styles["body"],
     )
@@ -314,8 +343,15 @@ def build_pdf() -> Path:
     story.append(p("三、IF-Net 神经网络如何构建", styles["h1"]))
     story.append(
         p(
-            "IF-Net 的输入是归一化 log-STFT 时频图，输出是每个分量的 ridge heatmap。网络没有直接回归单个频率点，而是先预测整条频率概率分布，再通过频率维 softmax 和 soft-argmax 得到连续 IF。"
-            "这样既保留了传统脊线提取的解释性，也使 IF 提取步骤可以通过梯度训练。",
+            "IF-Net 的输入是归一化 log-STFT 时频图。可以把它想成一张图：横轴是时间，纵轴是频率，亮的位置代表该频率附近能量较强。"
+            "传统脊线法是在这张图上用规则寻找亮线；IF-Net 则学习输出每个分量的 ridge heatmap。网络没有直接回归单个频率点，而是先预测整条频率概率分布，再通过频率维 softmax 和 soft-argmax 得到连续 IF。",
+            styles["body"],
+        )
+    )
+    story.append(
+        p(
+            "这种转化打通了传统方法和神经网络：heatmap 对应传统时频脊线，soft-argmax 对应从脊线概率中取连续频率值，训练损失则把预测 IF 和仿真真实 IF 对齐。"
+            "因为整个过程可微，网络可以自动调整卷积参数，学习不同窗宽、噪声和复杂场景下的脊线形态。",
             styles["body"],
         )
     )
@@ -326,10 +362,11 @@ def build_pdf() -> Path:
     add_bullets(
         story,
         [
-            "poly_like 专家：负责 linear、quadratic、cubic，训练中提高多项式约束和 identity_slope 约束，输出后使用 heatmap 加权多项式稳健拟合。",
-            "sinusoidal_like 专家：从通用模型继续训练，只看 sinusoidal_fm，增强调频深度、调频周期和二次谐波覆盖。",
-            "cross_overlap_like 专家：使用 balanced_refit_resume，覆盖 crossing、near_parallel、tangent_or_overlap 以及部分复杂混合场景。",
-            "jump_like 专家：从 balanced 专家继续训练，只看 local_jump，增强跳变幅度、跳变位置、过渡宽度和局部 bump 采样。",
+            "poly_like 专家：负责 linear、quadratic、cubic。这类 IF 整体较平滑，适合加入多项式残差和斜率一致性约束，输出后再用 heatmap 加权多项式稳健拟合，减少局部噪声导致的小抖动。",
+            "sinusoidal_like 专家：负责 sinusoidal_fm。它要学习周期性起伏的 IF，所以训练时增强调频深度、调频周期和二次谐波覆盖，避免只会拟合简单正弦。",
+            "cross_overlap_like 专家：负责 crossing、near_parallel、tangent_or_overlap。这些场景的共同点是分量之间距离很近，甚至短时间重合，因此重点是保持分量身份连续，不要在能量交汇处随意换线。",
+            "jump_like 专家：负责 local_jump。它要保留突变位置和突变幅度，不能被过强平滑抹掉，因此训练中增加跳变幅度、跳变位置、过渡宽度和局部 bump 采样。",
+            "为什么不用一个模型包打天下：所有类型共用一个模型时，模型容易在平滑类和突变类之间折中。专家体系把不同形态拆开学习，再用路由器决定该调用哪个专家，更容易稳定。",
         ],
         styles["body"],
     )
@@ -337,7 +374,9 @@ def build_pdf() -> Path:
     story.append(p("五、判别器/路由器如何构建", styles["h1"]))
     story.append(
         p(
-            "判别器是一个时频图分类器，用来决定信号应该送入哪类专家模型。它不直接输出 IF，而是输出四个专家组的概率。v3 判别器使用多尺度 STFT 输入：短窗更敏感于局部突变和快速变化，长窗提供更好的频率分辨率，中等窗宽处理一般 chirp 结构。",
+            "判别器也叫路由器，它是第一阶段的“分流器”。它不直接输出 IF，而是根据时频图判断当前信号更适合哪个专家：多项式、正弦调频、交叉/重合，还是局部跳变。"
+            "v3 判别器使用多尺度 STFT 输入：短窗更敏感于局部突变和快速变化，长窗提供更好的频率分辨率，中等窗宽处理一般 chirp 结构。"
+            "输出不是一个硬标签，而是四个专家的概率；这些概率后面也会作为置信度的一部分交给第二阶段。",
             styles["body"],
         )
     )
@@ -346,7 +385,15 @@ def build_pdf() -> Path:
     story.append(p("六、二级质量判别器如何构建", styles["h1"]))
     story.append(
         p(
-            "二级质量判别器是本轮新增模块。它的目标不是继续提升类型分类准确率，而是直接服务最终 IF 误差：当路由器低置信并运行 top-2 专家时，质量判别器根据候选专家的输出质量特征选择一个更可能低误差的 IF 曲线。",
+            "二级质量判别器解决的是另一个问题：路由标签正确，不一定代表最终 IF 最准。"
+            "例如某些 local_jump 样本可能被 cross_overlap_like 也拟合得不错，某些复杂多项式样本可能被 cross_overlap_like 临时救回来。"
+            "因此，当路由器低置信并运行 top-2 专家时，质量判别器不再问“这是什么类型”，而是问“这两个候选 IF 哪个误差更可能小”。",
+            styles["body"],
+        )
+    )
+    story.append(
+        p(
+            "质量判别器的输入包括候选 IF 的平滑度、heatmap 熵、残差形态、路由概率等特征。它只在不确定样本上帮助选择候选；对 crossing 这类容易被误伤的场景，当前仍保留 top-1 保护策略。",
             styles["body"],
         )
     )
@@ -354,6 +401,12 @@ def build_pdf() -> Path:
 
     story.append(PageBreak())
     story.append(p("七、第一阶段到目前为止完成的工作", styles["h1"]))
+    story.append(
+        p(
+            "到目前为止，第一阶段已经从概念验证推进到一个可以交给第二阶段使用的工程模块。下面这些工作不是彼此独立的脚本堆叠，而是围绕同一个目标展开：让系统能对不同类型 AM-FM 混合信号输出 IF 初值、候选分支和置信度。",
+            styles["body"],
+        )
+    )
     add_bullets(
         story,
         [
@@ -373,17 +426,32 @@ def build_pdf() -> Path:
 
     story.append(PageBreak())
     story.append(p("八、全类型定量结果（质量判别器组合）", styles["h1"]))
-    story.append(p("以下指标来自每类 512 个仿真样本，使用 v3 路由器、四专家、guarded top-2 fallback 与二级质量判别器，主要用于说明质量判别器相对上一版路由规则的改进。加入 jump_aux、top-2 候选覆盖率和第二阶段准入门槛后的最新判断见下一节。", styles["body"]))
+    story.append(
+        p(
+            "以下指标来自每类 512 个仿真样本，使用 v3 路由器、四专家、guarded top-2 fallback 与二级质量判别器。"
+            "这一页主要回答“当前 IF 曲线预测大概是什么水平”。MAE 越小越好；Median 反映典型样本；P95 反映少数难例的尾部误差；Fallback 表示有多少样本触发了 top-2 候选机制。"
+            "加入 jump_aux、top-2 候选覆盖率和第二阶段准入门槛后的最新判断见下一节。",
+            styles["body"],
+        )
+    )
     add_metric_table(story, quality_metrics, styles)
     story.append(Spacer(1, 0.25 * cm))
     story.append(p("与上一版 guarded top-2 规则的对比", styles["h2"]))
+    story.append(
+        p(
+            "这张对比表用于说明二级质量判别器的作用：它不会改变所有样本，但在低置信或候选专家竞争时，可以让最终选择更贴近真实 IF。变化/Hz 为负数表示误差降低。",
+            styles["body"],
+        )
+    )
     add_comparison_table(story, baseline_metrics, quality_metrics, styles)
 
     story.append(PageBreak())
     story.append(p("九、第二阶段准入评估", styles["h1"]))
     story.append(
         p(
-            "准入评估使用 router_hard_v3、quality_selector_v1、local_jump_aux_v3 和 guarded_special top-2 候选导出。"
+            "准入评估不是单纯看平均 MAE，而是判断第一阶段输出能不能作为第二阶段 ICCD 参数优化的初始条件。"
+            "第二阶段需要的不只是单条 IF 曲线，还包括置信度、候选分支、交叉身份稳定性和 local_jump 跳变位置。"
+            "本次准入评估使用 router_hard_v3、quality_selector_v1、local_jump_aux_v3 和 guarded_special top-2 候选导出。"
             f"当前主评估 ready_for_stage2={readiness['ready_for_stage2']}；"
             f"local_jump 跳变事件平均定位误差为 {readiness['scenarios']['local_jump']['jump_event_mae_ms']:.2f} ms，"
             f"top-2 候选覆盖率为 {readiness['aggregate']['candidate_oracle_coverage_10hz'] * 100:.2f}%。",
@@ -397,22 +465,43 @@ def build_pdf() -> Path:
             f"为检查稳定性，又使用 seed=67890 复核：top-2 候选覆盖率为 {readiness_seed2['aggregate']['candidate_oracle_coverage_10hz'] * 100:.2f}%，"
             f"local_jump 跳变事件平均定位误差为 {readiness_seed2['scenarios']['local_jump']['jump_event_mae_ms']:.2f} ms，"
             f"sinusoidal_fm MAE 为 {readiness_seed2['scenarios']['sinusoidal_fm']['if_mae_hz']:.2f} Hz。"
-            "两次正式复核均通过全部准入门槛，因此第一阶段已经可以作为第二阶段 ICCD 参数估计的初始 IF 输入。",
+            "两次正式复核均通过全部准入门槛，因此第一阶段已经可以作为第二阶段 ICCD 参数估计的初始 IF 输入。"
+            "需要注意：这里的“通过”表示初值质量足够，而不是表示所有局部误差都已经消失。",
             styles["body"],
         )
     )
 
     story.append(PageBreak())
     story.append(p("十、代表样本处理结果", styles["h1"]))
-    story.append(p("每类信号各抽取一个代表样本，图中绿色为真实 IF，蓝色虚线为预测 IF。该代表图仍来自稳定组合可视化样本，用于观察典型脊线拟合形态。", styles["body"]))
+    story.append(
+        p(
+            "每类信号各抽取一个代表样本，用来帮助读者直观看到模型在不同 IF 形态上的输出。"
+            "表中的样本 MAE 只代表这一张图，不等同于整类平均性能；整类平均请看前面的定量表和准入评估。"
+            "图中绿色为真实 IF，蓝色虚线为预测 IF。若两条线基本重合，说明第一阶段给出的初值很好；若局部偏离，则第二阶段应利用置信度和候选分支继续优化。",
+            styles["body"],
+        )
+    )
     add_example_table(story, examples, styles)
 
     story.append(PageBreak())
     story.append(p("十一、全类型处理图总览", styles["h1"]))
+    story.append(
+        p(
+            "这一页把八类代表样本放在一起。它的作用是快速检查模型是否出现明显错类、漏分量或整体漂移。"
+            "当前图已经按最新稳定组合重新生成，crossing 和 near_parallel 不再使用旧的偏难样本。",
+            styles["body"],
+        )
+    )
     add_image(story, FIG_DIR / "all_scenarios_overview.png", max_width=18.0 * cm, max_height=17.0 * cm)
 
     story.append(PageBreak())
     story.append(p("十二、存在的问题", styles["h1"]))
+    story.append(
+        p(
+            "虽然第一阶段已经达到进入第二阶段的要求，但它仍然是“初始 IF 估计器”，不是最终物理参数求解器。下面这些问题不会阻止进入第二阶段，但会影响第二阶段如何使用第一阶段输出：高置信样本可以更强地约束，低置信或多候选样本应该保留优化空间。",
+            styles["body"],
+        )
+    )
     add_bullets(
         story,
         [
@@ -429,6 +518,12 @@ def build_pdf() -> Path:
     )
 
     story.append(p("十三、优化方向与下一步计划", styles["h1"]))
+    story.append(
+        p(
+            "下一步不建议继续无限追求第一阶段单点 MAE，而是要把第一阶段输出正式接入第二阶段。第二阶段应把 IF 曲线当成可优化初值，并使用置信度决定每个时间片、每个分量的约束强度。",
+            styles["body"],
+        )
+    )
     add_bullets(
         story,
         [
@@ -445,6 +540,13 @@ def build_pdf() -> Path:
 
     story.append(PageBreak())
     story.append(p("附录：各类型单独处理图", styles["h1"]))
+    story.append(
+        p(
+            "附录给出每类代表样本的完整处理图：第一行是原始混合信号，第二行是路由器对四类专家的概率，第三行是时频图与 IF 曲线。"
+            "绿色线为真实 IF，蓝色虚线为预测 IF；标题中的 selected 表示最终采用的专家，top 表示路由器概率最高的专家，fallback 表示是否运行了 top-2 候选。",
+            styles["body"],
+        )
+    )
     plot_dir = FIG_DIR / "plots"
     for idx, (name, label) in enumerate(SCENARIO_LABELS.items()):
         if idx and idx % 2 == 0:
