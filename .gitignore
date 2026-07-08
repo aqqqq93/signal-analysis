@@ -24,6 +24,15 @@ ifnet_stage1/**/__pycache__/
 ifnet_stage1/**/*.pyc
 ifnet_stage1/src/*.egg-info/
 
+# Stage 2 code is tracked; generated runs and binary model artifacts are not.
+stage2_iccd/runs/
+stage2_iccd/**/*.pt
+stage2_iccd/**/*.pth
+stage2_iccd/**/*.ckpt
+stage2_iccd/**/__pycache__/
+stage2_iccd/**/*.pyc
+stage2_iccd/src/*.egg-info/
+
 # Keep the current technical summary PDF, but ignore other generated outputs by default.
 output/*
 !output/pdf/

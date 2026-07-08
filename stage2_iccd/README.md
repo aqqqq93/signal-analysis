@@ -1,18 +1,63 @@
-# Stage 2: ICCD Parameter Estimation
+# Stage 2: Differentiable ICCD Unfolding
 
-This folder is reserved for the second stage of the project.
+This folder contains the second-stage prototype: frozen stage-1 IF estimates are used to initialize a differentiable ICCD reconstruction layer. The first training phase only updates:
 
-Planned inputs from stage 1:
+- the ICCD Tikhonov parameter `alpha`;
+- the soft weights over top-k IF candidates;
+- a small 1D IF refinement head.
 
-- IF curves;
-- ridge heatmaps or confidence maps;
-- top-2 candidate IF curves;
-- route probabilities and selected expert labels;
-- uncertainty metrics for deciding whether an IF estimate is suitable for ICCD initialization.
+The stage-1 IF-Net checkpoint stays frozen during this phase. Once reconstruction is stable, the same code can be extended to unfreeze IF-Net and train the whole pipeline end to end.
 
-Planned work:
+## Principle
 
-- build an ICCD parameter-estimation interface initialized by IF-Net output;
-- compare convergence from neural IF initialization versus traditional ridge initialization;
-- define acceptance criteria for entering full reconstruction.
+ICCD assumes each component can be written as
 
+```text
+x_m(t) = a_m(t) cos(phi_m(t)) + b_m(t) sin(phi_m(t))
+phi_m(t) = 2 pi integral IF_m(t) dt
+```
+
+The envelopes `a_m(t)` and `b_m(t)` are represented by a low-order Fourier basis. Given IF curves, the code builds the ICCD dictionary and solves a batched Tikhonov least-squares problem:
+
+```text
+theta = (H^T H + alpha I)^(-1) H^T x
+x_hat_m = H_m theta_m
+```
+
+Because the dictionary is built with PyTorch tensors and the solve uses `torch.linalg.solve`, gradients can flow from reconstruction loss back to the refined IF curves, candidate weights, and `alpha`.
+
+## Important Files
+
+- `src/stage2_iccd/differentiable_iccd.py`: differentiable real-valued ICCD layer.
+- `src/stage2_iccd/model.py`: candidate mixer, lightweight IF refinement head, and full stage-2 model.
+- `src/stage2_iccd/candidates.py`: frozen IF-Net candidate provider plus an oracle-perturbed debug provider.
+- `src/stage2_iccd/train_stage2.py`: training loop for the frozen-IF-Net stage.
+- `configs/default.yaml`: quick debug training with perturbed ground-truth IF candidates.
+- `configs/frozen_ifnet.yaml`: real stage-2 training initialized by a frozen stage-1 checkpoint.
+
+## Quick Checks
+
+From the repository root:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.smoke_test
+```
+
+Short debug training:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/default.yaml --steps 20 --batch-size 2 --run-dir stage2_iccd/runs/debug
+```
+
+Frozen IF-Net training:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/frozen_ifnet.yaml
+```
+
+`default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.
+
+For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yaml` can use either one checkpoint or a `checkpoints:` list. With multiple checkpoints, the candidate mixer learns soft weights across frozen expert IF outputs; with one checkpoint, it falls back to raw-plus-smoothed candidates for debugging.

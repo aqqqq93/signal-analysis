@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stage2-iccd"
+version = "0.1.0"
+description = "Stage-2 differentiable ICCD unfolding initialized by frozen IF-Net outputs."
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.0",
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+]
+
+[project.scripts]
+stage2-train-iccd = "stage2_iccd.train_stage2:main"
+stage2-smoke = "stage2_iccd.smoke_test:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

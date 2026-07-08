@@ -1,0 +1,66 @@
+seed: 20260708
+device: auto
+run_dir: stage2_iccd/runs/default
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -4.0
+  snr_db_max: 22.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 1.0
+    crossing: 1.0
+    near_parallel: 1.0
+    local_jump: 1.0
+    tangent_or_overlap: 1.0
+  noise_types:
+    white: 0.55
+    colored: 0.25
+    impulsive: 0.10
+    trend: 0.10
+
+init:
+  # Use oracle_perturbed for quick ICCD-layer debugging.
+  # Switch to frozen_ifnet_checkpoint for real stage-1 initialization.
+  mode: oracle_perturbed
+  num_candidates: 2
+  noise_hz: 10.0
+  alt_noise_hz: 24.0
+  smooth_kernel: 31
+  checkpoint: ifnet_stage1/runs/balanced_refit_resume/latest.pt
+
+iccd:
+  amplitude_order: 8
+  period_factor: 2.0
+  alpha_init: 1.0
+  alpha_min: 0.00001
+  solve_jitter: 0.000001
+
+model:
+  num_candidates: 2
+  refine_channels: 32
+  refine_layers: 3
+  max_refine_hz: 30.0
+
+train:
+  steps: 500
+  batch_size: 8
+  lr: 0.0002
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  print_every: 25
+  save_every: 250
+  val_batches: 4
+  loss:
+    reconstruction: 1.0
+    component: 0.20
+    if_l1: 0.06
+    smooth: 0.001
+    delta: 0.0005
+    candidate_entropy: 0.001
