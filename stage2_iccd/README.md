@@ -35,6 +35,10 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/eval_scenarios.py`: per-scenario reconstruction and IF evaluation.
 - `results_summary_zh.md`: current Chinese training summary, per-scenario metrics, and next-step diagnosis.
 - `configs/separated_frozen.yaml`: easier separated two-component curriculum before all scenarios.
+- `configs/simple_multicomponent_long.yaml`: longer simple separated two-component training; current best simple checkpoint source.
+- `configs/simple_multicomponent_robust.yaml`: robustness probe for simple separated signals; useful for diagnosis, not the current best.
+- `configs/simple_single_component.yaml`: active-component masked single-component training.
+- `configs/simple_active_mixed.yaml`: mixed one/two active-component probe; diagnostic only, not the current best.
 - `configs/all_multiexpert.yaml`: all-scenario training with several frozen IF-Net experts as candidate IF sources.
 - `configs/local_jump_frozen.yaml`: focused local-jump stage-2 specialist.
 - `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
@@ -69,6 +73,13 @@ Per-scenario evaluation:
 ```powershell
 $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/frozen_ifnet/latest.pt --output-dir stage2_iccd/runs/frozen_ifnet/eval_scenarios
+```
+
+Evaluation with explicit noise/SNR overrides:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/simple_multicomponent_long/latest.pt --output-dir stage2_iccd/runs/simple_multicomponent_long/eval_simple_robust --scenarios linear quadratic cubic --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
 ```
 
 `default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.

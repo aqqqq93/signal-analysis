@@ -193,3 +193,198 @@
 - 对 local_jump：不建议直接进入大规模联合训练，应先补充跳变位置辅助头或分段式 refinement，否则端到端训练可能把误差传回 IF-Net，造成不稳定的错误修正。
 
 因此，当前判断是：第二阶段框架已经成立，通用模型基本可用；但 local_jump 需要作为下一轮重点结构优化，而不是只依赖更长训练。
+
+## 10. 2026-07-08 补充：先打牢简单多分量
+
+根据“先专攻单分量与简单多分量，交叉、跳变等困难类型后续再攻克”的路线，本轮先没有把 crossing、local_jump 等困难类型继续混入训练，而是集中处理 linear、quadratic、cubic 这三类简单分离多分量信号。
+
+### 10.1 为什么暂时没有直接做真正单分量
+
+当前第二阶段使用的冻结 IF-Net checkpoint 是按 2 分量输出训练的。如果直接把真实 1 分量样本喂给第二阶段，第二条不存在的分量会带来两个问题：
+
+- component loss 可以用零分量匹配处理，但 IF loss 仍会惩罚第二条“并不存在”的 IF；
+- 可微 ICCD 层会尝试解释不存在的第二分量，可能把噪声当作弱分量重构。
+
+因此，真正单分量需要先加入 inactive component mask 或 active-component loss mask。为了保证优化路径干净，本轮先做“简单、分离、2 分量”。
+
+### 10.2 simple_multicomponent_long
+
+配置：`configs/simple_multicomponent_long.yaml`
+
+训练路径：
+
+- 从 `stage2_iccd/runs/separated_frozen/latest.pt` 续训；
+- 只使用 linear、quadratic、cubic；
+- 训练噪声先限制为 white + colored；
+- SNR 范围设为 4 dB 到 28 dB；
+- 继续训练 800 步。
+
+训练后 checkpoint：`stage2_iccd/runs/simple_multicomponent_long/latest.pt`
+
+与原 `separated_frozen` 在同一 easy 条件下比较：
+
+| 模型 | aggregate SNR / dB | aggregate IF MAE / Hz | smooth |
+| --- | ---: | ---: | ---: |
+| separated_frozen | 25.62 | 2.20 | 9.21 |
+| simple_multicomponent_long | 25.93 | 1.64 | 2.59 |
+
+分场景结果：
+
+| 场景 | SNR / dB | IF MAE / Hz |
+| --- | ---: | ---: |
+| linear | 26.74 | 1.30 |
+| quadratic | 25.94 | 1.58 |
+| cubic | 25.12 | 2.06 |
+| aggregate | 25.93 | 1.64 |
+
+结论：这一步达到了较好的效果。IF 精度明显提升，曲线二阶平滑度明显降低，说明第二阶段 refinement head 没有只是追求重构误差，而是把 IF 轨迹也修得更稳。
+
+### 10.3 鲁棒条件复测
+
+在更复杂条件下评估：
+
+- SNR 范围：-2 dB 到 24 dB；
+- 噪声：white 0.55、colored 0.25、impulsive 0.10、trend 0.10。
+
+| 模型 | aggregate SNR / dB | aggregate IF MAE / Hz | smooth |
+| --- | ---: | ---: | ---: |
+| separated_frozen | 22.94 | 2.91 | 13.68 |
+| simple_multicomponent_long | 22.86 | 2.55 | 4.46 |
+
+结论：鲁棒条件下重构 SNR 基本持平，IF MAE 和 smoothness 仍然更好。因此 `simple_multicomponent_long` 可以作为当前简单多分量阶段的最佳模型。
+
+### 10.4 simple_multicomponent_robust 尝试
+
+配置：`configs/simple_multicomponent_robust.yaml`
+
+训练路径：
+
+- 从 `simple_multicomponent_long/latest.pt` 续训；
+- 训练时加入 impulsive 和 trend 噪声；
+- 继续训练 600 步。
+
+结果：
+
+| 评估条件 | SNR / dB | IF MAE / Hz | smooth |
+| --- | ---: | ---: | ---: |
+| easy | 25.53 | 1.74 | 2.21 |
+| robust | 22.48 | 2.58 | 3.23 |
+
+结论：鲁棒续训没有超过 `simple_multicomponent_long`。它让 IF 曲线更平滑，但重构 SNR 略降，且 robust IF MAE 没有实质改善。因此它目前只作为诊断实验保留，不作为第一步最佳 checkpoint。
+
+### 10.5 当前第一步判断
+
+当前简单多分量阶段可以视为初步达标：
+
+- easy 条件 aggregate IF MAE 已降到约 1.64 Hz；
+- robust 条件 aggregate IF MAE 约 2.55 Hz；
+- linear/quadratic/cubic 都没有明显失控；
+- 可微 ICCD 层的 alpha、候选权重和 IF refinement head 都能稳定训练。
+
+下一步不建议立刻攻 local_jump。更稳的顺序是：
+
+1. 增加 active-component mask，补真正单分量训练和评估；
+2. 在简单多分量基础上加入 near_parallel 或更小间隔的非交叉多分量；
+3. 简单和近邻场景都稳定后，再进入 crossing；
+4. 最后单独攻 local_jump，并加入跳变位置辅助头。
+
+## 11. 2026-07-08 补充：单分量与单/多分量合并尝试
+
+### 11.1 active-component mask
+
+为了正确处理真正单分量，代码中新增了 active-component mask：
+
+- 仿真器现在可以通过 `active_components` 指定真实活跃分量数；
+- inactive component 的幅值设为 0；
+- component/reconstruction loss 仍约束模型不要重构不存在的分量；
+- IF loss 只在 active component 上计算，避免用不存在的第二条 IF 污染训练。
+
+这一步是必要的。否则单分量训练会把“第二条不存在的 IF”当作真实目标，造成错误优化。
+
+### 11.2 单分量专用模型
+
+配置：`configs/simple_single_component.yaml`
+
+训练路径：
+
+- 从 `simple_multicomponent_long/latest.pt` 续训；
+- 只使用 linear、quadratic、cubic；
+- `active_components: 1`；
+- 训练 500 步。
+
+checkpoint：`stage2_iccd/runs/simple_single_component/latest.pt`
+
+单分量 easy 条件评估：
+
+| 场景 | SNR / dB | IF MAE / Hz | component L1 |
+| --- | ---: | ---: | ---: |
+| linear | 26.64 | 0.65 | 0.029 |
+| quadratic | 27.71 | 0.69 | 0.025 |
+| cubic | 26.83 | 0.73 | 0.028 |
+| aggregate | 27.06 | 0.69 | 0.028 |
+
+单分量 robust 条件评估：
+
+| 场景 | SNR / dB | IF MAE / Hz | component L1 |
+| --- | ---: | ---: | ---: |
+| linear | 23.35 | 0.73 | 0.041 |
+| quadratic | 23.87 | 0.78 | 0.039 |
+| cubic | 23.71 | 0.82 | 0.040 |
+| aggregate | 23.64 | 0.78 | 0.040 |
+
+结论：单分量专用模型效果很好，说明 active-component mask 是有效的。
+
+### 11.3 单分量模型不能直接处理双分量
+
+把 `simple_single_component/latest.pt` 放到 2 active components 的 easy 条件下评估：
+
+| 条件 | SNR / dB | IF MAE / Hz | component L1 |
+| --- | ---: | ---: | ---: |
+| 2 分量 easy | 7.57 | 7.07 | 0.223 |
+
+结论：单分量模型非常专用，不能直接用于双分量。它会倾向于只解释一个主分量，导致另一个真实分量重构失败。
+
+### 11.4 双分量模型处理单分量的表现
+
+把 `simple_multicomponent_long/latest.pt` 放到 1 active component 的 easy 条件下评估：
+
+| 条件 | SNR / dB | IF MAE / Hz | component L1 |
+| --- | ---: | ---: | ---: |
+| 1 分量 easy | 28.49 | 1.32 | 0.189 |
+
+结论：双分量模型对单分量的重构 SNR 和 IF 还可以，但 component L1 很高，说明它会把单个真实分量拆到两个输出槽位中。这对后续可解释分量分解是不利的。
+
+### 11.5 mixed-active 统一模型尝试
+
+配置：`configs/simple_active_mixed.yaml`
+
+训练路径：
+
+- 从 `simple_multicomponent_long/latest.pt` 续训；
+- 训练样本中 45% 为单分量，55% 为双分量；
+- 训练 700 步。
+
+评估结果：
+
+| 条件 | SNR / dB | IF MAE / Hz | component L1 |
+| --- | ---: | ---: | ---: |
+| 1 分量 easy | 27.58 | 1.53 | 0.063 |
+| 2 分量 easy | 23.71 | 2.96 | 0.061 |
+| mixed robust | 22.71 | 2.70 | 0.070 |
+
+结论：mixed-active 统一模型没有超过专用模型组合。它比单分量专用模型差，也比双分量专用模型差，说明单/多分量在当前第二阶段结构中存在明显任务冲突。
+
+### 11.6 当前最稳组合
+
+当前不建议强行用一个模型同时处理单分量和双分量。最稳组合是：
+
+- 单分量：`stage2_iccd/runs/simple_single_component/latest.pt`
+- 简单双分量：`stage2_iccd/runs/simple_multicomponent_long/latest.pt`
+
+进入下一步之前，建议先加 active-component 判别器或能量型路由器：
+
+- 若判定为 1 active component，走单分量专用模型；
+- 若判定为 2 active components，走简单双分量模型；
+- 如果判别置信度低，保留 top-2 active-count 候选，进入第二阶段时同时输出置信度。
+
+因此，当前简单单分量和简单双分量都已经有可用模型，但还需要一个轻量 active-count 路由器，才能形成完整稳定的第一层处理流程。

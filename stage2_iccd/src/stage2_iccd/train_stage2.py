@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 from pathlib import Path
 import random
@@ -11,7 +12,6 @@ import torch
 from tqdm import trange
 
 from ifnet_stage1.config import choose_device, load_config
-from ifnet_stage1.losses import permutation_l1
 from ifnet_stage1.simulation import ChirpSimulator, sim_config_from_dict
 
 from .candidates import FrozenIFNetCandidateProvider, OraclePerturbedCandidateProvider
@@ -68,8 +68,11 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     resume_path = train_cfg.get("resume")
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        load_stage2_model_state(model, ckpt["model"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except ValueError:
+            print("Optimizer state is incompatible with the current model; restarting optimizer.")
         start_step = int(ckpt.get("step", 0))
 
     batch_size = int(train_cfg.get("batch_size", 8))
@@ -89,11 +92,12 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         clean = batch["clean"]
         target_if = batch["if_hz"]
         target_components = batch["components"]
+        active_mask = batch.get("active_mask")
         candidate_if = get_candidates(provider, init_cfg, signal, target_if, sim_cfg.n_samples)
         candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max).detach()
 
         out = model(signal, candidate_if)
-        loss, metrics = compute_loss(out, clean, target_components, target_if, sim_cfg.fs, weights)
+        loss, metrics = compute_loss(out, clean, target_components, target_if, sim_cfg.fs, weights, active_mask=active_mask)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -167,6 +171,7 @@ def compute_loss(
     target_if: torch.Tensor,
     fs: float,
     weights: dict[str, Any],
+    active_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     rec = out["reconstruction"]
     comps = out["components"]
@@ -174,7 +179,7 @@ def compute_loss(
     loss_rec = torch.mean((rec - clean).pow(2))
     loss_comp = component_permutation_mse(comps, target_components)
     loss_comp_l1 = component_permutation_l1(comps, target_components)
-    loss_if = permutation_l1(refined_if, target_if)
+    loss_if = masked_permutation_l1(refined_if, target_if, active_mask)
     loss_smooth = if_smoothness(refined_if)
     loss_entropy = candidate_entropy(out["candidate_weights"])
     loss_delta = out["delta_if_hz"].pow(2).mean()
@@ -194,8 +199,31 @@ def compute_loss(
         "smooth": float(loss_smooth.detach().cpu()),
         "delta_rms_hz": float(torch.sqrt(loss_delta.detach()).cpu()),
         "rec_snr_db": float(reconstruction_snr_db(clean, rec).mean().detach().cpu()),
+        "active_components": float(active_mask.sum(dim=1).mean().detach().cpu()) if active_mask is not None else float(target_if.shape[1]),
     }
     return loss, metrics
+
+
+def masked_permutation_l1(pred_if: torch.Tensor, target_if: torch.Tensor, active_mask: torch.Tensor | None = None) -> torch.Tensor:
+    if pred_if.shape[:2] != target_if.shape[:2]:
+        raise ValueError("Predicted and target IF tensors must share [B, Q].")
+    bsz, q, _ = pred_if.shape
+    if active_mask is None:
+        active_mask = torch.ones((bsz, q), device=pred_if.device, dtype=pred_if.dtype)
+    else:
+        active_mask = active_mask.to(device=pred_if.device, dtype=pred_if.dtype)
+    perms = list(itertools.permutations(range(q)))
+    rows = torch.arange(q, device=pred_if.device)
+    costs = []
+    component_cost = torch.empty((bsz, q, q), device=pred_if.device, dtype=pred_if.dtype)
+    for pred_idx in range(q):
+        component_cost[:, pred_idx, :] = (pred_if[:, pred_idx : pred_idx + 1] - target_if).abs().mean(dim=-1)
+    for perm in perms:
+        perm_tensor = torch.tensor(perm, device=pred_if.device)
+        matched = component_cost[:, rows, perm_tensor]
+        matched_mask = active_mask[:, perm_tensor]
+        costs.append((matched * matched_mask).sum(dim=1) / matched_mask.sum(dim=1).clamp_min(1.0))
+    return torch.stack(costs, dim=1).min(dim=1).values.mean()
 
 
 @torch.no_grad()
@@ -217,7 +245,15 @@ def evaluate(
         candidate_if = get_candidates(provider, init_cfg, batch["signal"], batch["if_hz"], sim_cfg.n_samples)
         candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max).detach()
         out = model(batch["signal"], candidate_if)
-        _, metrics = compute_loss(out, batch["clean"], batch["components"], batch["if_hz"], sim_cfg.fs, weights)
+        _, metrics = compute_loss(
+            out,
+            batch["clean"],
+            batch["components"],
+            batch["if_hz"],
+            sim_cfg.fs,
+            weights,
+            active_mask=batch.get("active_mask"),
+        )
         rows.append(metrics)
     return {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
 
@@ -232,6 +268,25 @@ def save_checkpoint(path: Path, model: Stage2ICCDModel, optimizer, cfg: dict[str
         },
         path,
     )
+
+
+def load_stage2_model_state(model: Stage2ICCDModel, state: dict[str, torch.Tensor]) -> None:
+    """Load current or legacy stage-2 checkpoints.
+
+    Early checkpoints used a single global `mixer.logits` parameter. The current
+    mixer uses `mixer.bias` plus a learnable temperature. Mapping logits to bias
+    keeps old runs usable while leaving new parameters at their initialized
+    values.
+    """
+
+    migrated = dict(state)
+    if "mixer.logits" in migrated and "mixer.bias" not in migrated:
+        migrated["mixer.bias"] = migrated.pop("mixer.logits")
+    missing, unexpected = model.load_state_dict(migrated, strict=False)
+    allowed_missing = {"mixer.raw_temperature"}
+    real_missing = [key for key in missing if key not in allowed_missing]
+    if real_missing or unexpected:
+        raise RuntimeError(f"Could not load stage-2 checkpoint. missing={real_missing}, unexpected={unexpected}")
 
 
 def main() -> None:

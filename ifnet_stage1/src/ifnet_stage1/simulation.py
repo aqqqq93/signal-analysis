@@ -31,6 +31,7 @@ class SimConfig:
     scenario_weights: dict[str, float] | None = None
     noise_types: dict[str, float] | None = None
     scenario_params: dict[str, dict] | None = None
+    active_components: object = None
 
 
 class ChirpSimulator:
@@ -72,6 +73,7 @@ class ChirpSimulator:
         amp_curves = []
         jump_centers = []
         jump_valid = []
+        active_masks = []
         scenario_out: list[str] = []
         noise_out: list[str] = []
 
@@ -80,13 +82,16 @@ class ChirpSimulator:
                 self.scenario_names, self.scenario_probs
             )
             noise_name = self._choice(self.noise_names, self.noise_probs)
+            active_count = self._active_count()
             if_hz = self._make_if_curves(scenario)
             metadata = getattr(self, "_last_metadata", {})
-            amps = self._make_amplitudes()
+            amps = self._make_amplitudes(active_count)
             comps = self._render_components(if_hz, amps)
             clean_sig = comps.sum(dim=0)
             noisy = self._add_noise(clean_sig, noise_name)
             scale = noisy.std().clamp_min(1.0e-6)
+            active_mask = torch.zeros(self.cfg.num_components, dtype=torch.float32)
+            active_mask[:active_count] = 1.0
 
             signals.append(noisy / scale)
             clean.append(clean_sig / scale)
@@ -95,6 +100,7 @@ class ChirpSimulator:
             amp_curves.append(amps / scale)
             jump_centers.append(self._metadata_vector(metadata, "jump_center", float("nan"), torch.float32))
             jump_valid.append(self._metadata_vector(metadata, "jump_valid", False, torch.bool))
+            active_masks.append(active_mask)
             scenario_out.append(scenario)
             noise_out.append(noise_name)
 
@@ -107,6 +113,7 @@ class ChirpSimulator:
             "amplitude": torch.stack(amp_curves).to(target_device),
             "jump_center": torch.stack(jump_centers).to(target_device),
             "jump_valid": torch.stack(jump_valid).to(target_device),
+            "active_mask": torch.stack(active_masks).to(target_device),
             "scenario": scenario_out,
             "noise_type": noise_out,
         }
@@ -267,9 +274,13 @@ class ChirpSimulator:
             curves.append(common + 100.0 + self._rand(-25.0, 25.0) * self.u)
         return torch.stack(curves)
 
-    def _make_amplitudes(self) -> torch.Tensor:
+    def _make_amplitudes(self, active_count: int | None = None) -> torch.Tensor:
         amps = []
+        active_count = self.cfg.num_components if active_count is None else int(active_count)
         for i in range(self.cfg.num_components):
+            if i >= active_count:
+                amps.append(torch.zeros_like(self.u))
+                continue
             base = self._rand(0.55, 1.15)
             if i > 0:
                 db_drop = self._rand(0.0, 12.0)
@@ -284,6 +295,20 @@ class ChirpSimulator:
                 envelope = envelope * (0.35 + 0.65 * torch.exp(-0.5 * ((self.u - center) / width).pow(2)))
             amps.append(envelope.clamp_min(0.03))
         return torch.stack(amps)
+
+    def _active_count(self) -> int:
+        if self.cfg.active_components is None:
+            return self.cfg.num_components
+        value = self.cfg.active_components
+        if isinstance(value, dict):
+            names = [int(key) for key in value]
+            probs = self._normalize_probs([float(value[str(name)] if str(name) in value else value[name]) for name in names])
+            return max(1, min(self.cfg.num_components, names[torch.multinomial(probs, 1, generator=self.rng).item()]))
+        if isinstance(value, (list, tuple)):
+            choices = [int(item) for item in value]
+            idx = int(torch.randint(len(choices), (), generator=self.rng).item())
+            return max(1, min(self.cfg.num_components, choices[idx]))
+        return max(1, min(self.cfg.num_components, int(value)))
 
     def _render_components(self, if_hz: torch.Tensor, amps: torch.Tensor) -> torch.Tensor:
         phase0 = 2.0 * torch.pi * torch.rand(self.cfg.num_components, generator=self.rng)
@@ -393,4 +418,5 @@ def sim_config_from_dict(data: dict) -> SimConfig:
         scenario_weights=dict(data.get("scenario_weights", {name: 1.0 for name in SCENARIOS})),
         noise_types=dict(data.get("noise_types", {"white": 1.0})),
         scenario_params=dict(data.get("scenario_params", {})),
+        active_components=data.get("active_components"),
     )
