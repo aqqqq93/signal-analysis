@@ -388,3 +388,120 @@ checkpoint：`stage2_iccd/runs/simple_single_component/latest.pt`
 - 如果判别置信度低，保留 top-2 active-count 候选，进入第二阶段时同时输出置信度。
 
 因此，当前简单单分量和简单双分量都已经有可用模型，但还需要一个轻量 active-count 路由器，才能形成完整稳定的第一层处理流程。
+
+## 12. 2026-07-08 补充：active-count 路由器与 near_parallel 纳入
+
+在完成单分量专用模型和简单双分量专用模型之后，本轮继续补上了一个轻量 active-count 路由器。它的任务不是直接预测完整 IF，而是先判断输入信号更像 1 个活跃分量还是 2 个活跃分量，然后把样本送到对应的第二阶段模型：
+
+- 1 active component：使用 `stage2_iccd/runs/simple_single_component/latest.pt`；
+- 2 active components：使用 `stage2_iccd/runs/simple_multicomponent_long/latest.pt`。
+
+这样做的原因是，前面的实验已经说明“一个统一模型同时处理单分量和双分量”会出现明显任务冲突。单分量模型很擅长单分量，但不能直接处理双分量；双分量模型能重构单分量，却容易把一个真实分量拆到两个输出槽位里。因此先做 active-count 判别，再走专门模型，比强行用一个模型覆盖所有情况更稳。
+
+### 12.1 新增代码
+
+本轮新增了以下代码和配置：
+
+- `src/stage2_iccd/active_count.py`：active-count 分类网络。输入来自多尺度 STFT 图和辅助统计特征，输出 `active_1` / `active_2` 两类概率、置信度和 margin；
+- `src/stage2_iccd/train_active_count.py`：active-count 路由器训练脚本；
+- `src/stage2_iccd/eval_active_count.py`：active-count 单独评估脚本；
+- `src/stage2_iccd/eval_active_routed_stage2.py`：把 active-count 路由器接到单分量/双分量 Stage2 模型后的端到端评估脚本；
+- `configs/active_count_simple.yaml`：只包含 linear、quadratic、cubic 的初始路由器配置；
+- `configs/active_count_simple_near_parallel.yaml`：在简单场景基础上加入 near_parallel 的路由器配置。
+
+### 12.2 初始 active-count 路由器
+
+先用 `active_count_simple.yaml` 训练，只覆盖 linear、quadratic、cubic 的 1/2 active component 判别。
+
+在简单 easy 条件下：
+
+| 评估范围 | accuracy | active_1 accuracy | active_2 accuracy |
+| --- | ---: | ---: | ---: |
+| linear/quadratic/cubic | 99.1% | 99.7% | 98.5% |
+
+在 robust 条件下：
+
+| 评估范围 | accuracy | active_1 accuracy | active_2 accuracy |
+| --- | ---: | ---: | ---: |
+| linear/quadratic/cubic | 97.3% | 98.1% | 96.5% |
+
+接到 Stage2 后，linear/quadratic/cubic 的 routed 结果为：
+
+| 条件 | route accuracy | IF MAE / Hz | 重构 SNR / dB |
+| --- | ---: | ---: | ---: |
+| easy | 99.4% | 1.30 | 26.01 |
+| robust | 97.7% | 1.85 | 23.09 |
+
+结论：只看简单场景时，active-count 路由器已经足够稳定，可以把单分量和双分量模型组合起来使用。
+
+### 12.3 near_parallel 的问题与修正
+
+继续把同一个 active-count 路由器放到 near_parallel 上评估，发现准确率只有约 90%：
+
+| 条件 | accuracy | active_1 accuracy | active_2 accuracy |
+| --- | ---: | ---: | ---: |
+| near_parallel easy | 90.3% | 85.6% | 95.0% |
+| near_parallel robust | 90.2% | 88.9% | 91.6% |
+
+这个结果说明 near_parallel 的主要问题不在第二阶段 ICCD 重构本身，而在“路由器没有见过这类结构”。near_parallel 的时频图中，两条 IF 长时间接近并近似平行，能量分布容易被误判成一个宽一些的单分量脊线；反过来，某些单分量的缓慢弯曲也可能被误判成两个贴近分量。因此如果 active-count 路由器只用普通 separated linear/quadratic/cubic 训练，面对 near_parallel 会不稳定。
+
+为了修正这个问题，本轮训练了 `active_count_simple_near_parallel.yaml`，把 near_parallel 一并加入 active-count 训练。
+
+修正后，near_parallel 路由准确率明显提高：
+
+| 条件 | accuracy | active_1 accuracy | active_2 accuracy |
+| --- | ---: | ---: | ---: |
+| near_parallel easy | 99.1% | 100.0% | 98.3% |
+| near_parallel robust | 97.6% | 99.8% | 95.3% |
+
+同时重新检查 linear/quadratic/cubic，没有发生严重遗忘：
+
+| 条件 | accuracy | active_1 accuracy | active_2 accuracy |
+| --- | ---: | ---: | ---: |
+| simple easy | 98.6% | 100.0% | 97.2% |
+| simple robust | 96.8% | 100.0% | 93.7% |
+
+这里要注意一个小代价：加入 near_parallel 后，强噪声下简单双分量的路由准确率从约 96.5% 降到约 93.7%。这说明路由器容量和训练分布仍然有限，但端到端 Stage2 指标仍然可用。
+
+### 12.4 新路由器接入 Stage2 后的结果
+
+使用新路由器 `active_count_simple_near_parallel/latest.pt`，并接入：
+
+- 单分量模型：`simple_single_component/latest.pt`；
+- 双分量模型：`simple_multicomponent_long/latest.pt`。
+
+在 linear、quadratic、cubic、near_parallel 四类上做 routed Stage2 评估，结果如下：
+
+| 条件 | route accuracy | IF MAE / Hz | 重构 SNR / dB | component L1 |
+| --- | ---: | ---: | ---: | ---: |
+| easy | 98.8% | 1.18 | 26.21 | 0.039 |
+| robust | 97.3% | 1.64 | 23.42 | 0.050 |
+
+分场景看，单分量 IF MAE 基本稳定在 0.62-0.86 Hz；双分量中 near_parallel 的 IF MAE 为 easy 1.30 Hz、robust 1.66 Hz，说明第二阶段 ICCD 对 near_parallel 本身并不弱。当前 near_parallel 的主要风险已经从“重构能力不足”转移到“路由器是否足够稳定”。
+
+### 12.5 当前判断
+
+到目前为止，第一批可继续推进的第二阶段场景包括：
+
+- 单分量 linear / quadratic / cubic；
+- 简单双分量 linear / quadratic / cubic；
+- near_parallel。
+
+这些场景已经满足继续推进的基本门槛：路由准确率在 easy/robust 条件下都接近或超过 97%，端到端 IF MAE 在 1-2 Hz 左右，重构 SNR 大约 23-26 dB。
+
+暂时不建议直接把 crossing 和 local_jump 加进同一个训练任务。原因是：
+
+- crossing 的主要风险是分量身份交换，不能只靠 active-count 路由解决；
+- local_jump 的主要风险是跳变位置定位和跳变点附近的分段 IF 修正，需要显式 jump head 或 jump mask；
+- sinusoidal_fm 比 crossing/local_jump 更适合作为下一步，因为它仍属于连续 IF，只是周期性调制更强，适合作为从简单连续场景到困难场景之间的过渡。
+
+### 12.6 下一步优化顺序
+
+下一轮建议按下面顺序推进：
+
+1. 把 sinusoidal_fm 纳入当前 active-count + routed Stage2 流程，先看路由是否稳定，再看 Stage2 是否需要专门分支；
+2. 如果 sinusoidal_fm 的路由稳定但 IF MAE 偏高，优先训练 sinusoidal_fm 的 Stage2 分支，而不是马上解冻 IF-Net；
+3. 再进入 crossing，重点加入身份一致性约束和 top-2 候选保留；
+4. 最后集中处理 local_jump，加入跳变位置辅助头、jump mask 或分段 refinement。
+
+因此，本轮结论是：简单单/双分量和 near_parallel 的 Stage2 路由框架已经基本打通，可以继续往 sinusoidal_fm 扩展；但 crossing/local_jump 仍应作为后续专项攻克对象。

@@ -1,0 +1,62 @@
+seed: 20260713
+device: auto
+run_dir: stage2_iccd/runs/active_count_simple
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  active_components:
+    1: 0.50
+    2: 0.50
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -2.0
+  snr_db_max: 28.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 0.0
+    crossing: 0.0
+    near_parallel: 0.0
+    local_jump: 0.0
+    tangent_or_overlap: 0.0
+  noise_types:
+    white: 0.60
+    colored: 0.25
+    impulsive: 0.05
+    trend: 0.10
+
+stft:
+  hop_length: 4
+  target_n_fft: 256
+  log_eps: 1.0e-6
+  scales:
+    - n_fft: 128
+      win_length: 64
+    - n_fft: 256
+      win_length: 128
+    - n_fft: 512
+      win_length: 256
+
+active_count:
+  base_channels: 20
+  depth: 3
+  dropout: 0.08
+  use_aux_features: true
+  aux_feature_dim: 20
+  aux_hidden: 40
+
+train:
+  steps: 1600
+  batch_size: 32
+  lr: 0.00035
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 400
+  val_batches: 8
+  class_weights:
+    active_1: 1.0
+    active_2: 1.0

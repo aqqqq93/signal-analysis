@@ -33,7 +33,13 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/candidates.py`: frozen IF-Net candidate provider plus an oracle-perturbed debug provider.
 - `src/stage2_iccd/train_stage2.py`: training loop for the frozen-IF-Net stage.
 - `src/stage2_iccd/eval_scenarios.py`: per-scenario reconstruction and IF evaluation.
+- `src/stage2_iccd/active_count.py`: lightweight active-component count classifier.
+- `src/stage2_iccd/train_active_count.py`: active-count router training.
+- `src/stage2_iccd/eval_active_count.py`: active-count router evaluation.
+- `src/stage2_iccd/eval_active_routed_stage2.py`: routed stage-2 evaluation using the active-count router.
 - `results_summary_zh.md`: current Chinese training summary, per-scenario metrics, and next-step diagnosis.
+- `configs/active_count_simple.yaml`: active-count router for linear/quadratic/cubic one-vs-two active components.
+- `configs/active_count_simple_near_parallel.yaml`: active-count router extended with near_parallel samples.
 - `configs/separated_frozen.yaml`: easier separated two-component curriculum before all scenarios.
 - `configs/simple_multicomponent_long.yaml`: longer simple separated two-component training; current best simple checkpoint source.
 - `configs/simple_multicomponent_robust.yaml`: robustness probe for simple separated signals; useful for diagnosis, not the current best.
@@ -80,6 +86,27 @@ Evaluation with explicit noise/SNR overrides:
 ```powershell
 $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/simple_multicomponent_long/latest.pt --output-dir stage2_iccd/runs/simple_multicomponent_long/eval_simple_robust --scenarios linear quadratic cubic --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+Active-count router training:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_active_count --config stage2_iccd/configs/active_count_simple_near_parallel.yaml
+```
+
+Active-count router evaluation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_active_count --checkpoint stage2_iccd/runs/active_count_simple_near_parallel/latest.pt --output-dir stage2_iccd/runs/active_count_simple_near_parallel/eval_simple_easy --scenarios linear quadratic cubic --active-components 1 2
+```
+
+Routed stage-2 evaluation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_active_routed_stage2 --active-checkpoint stage2_iccd/runs/active_count_simple_near_parallel/latest.pt --single-checkpoint stage2_iccd/runs/simple_single_component/latest.pt --multi-checkpoint stage2_iccd/runs/simple_multicomponent_long/latest.pt --output-dir stage2_iccd/runs/active_count_simple_near_parallel/eval_routed_easy --scenarios linear quadratic cubic near_parallel --active-components 1 2
 ```
 
 `default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.

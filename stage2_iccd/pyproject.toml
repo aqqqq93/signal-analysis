@@ -18,6 +18,9 @@ dependencies = [
 stage2-train-iccd = "stage2_iccd.train_stage2:main"
 stage2-smoke = "stage2_iccd.smoke_test:main"
 stage2-eval-scenarios = "stage2_iccd.eval_scenarios:main"
+stage2-train-active-count = "stage2_iccd.train_active_count:main"
+stage2-eval-active-count = "stage2_iccd.eval_active_count:main"
+stage2-eval-active-routed = "stage2_iccd.eval_active_routed_stage2:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
