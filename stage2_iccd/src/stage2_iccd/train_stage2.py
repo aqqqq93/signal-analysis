@@ -106,7 +106,8 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 "step": step,
                 "loss": float(loss.detach().cpu()),
                 "alpha": float(out["alpha"].detach().cpu()),
-                "candidate_weights": [float(v) for v in out["candidate_weights"].detach().cpu()],
+                "candidate_temperature": float(out["candidate_temperature"].detach().cpu()),
+                "candidate_weights": [float(v) for v in out["candidate_weights"].detach().mean(dim=0).cpu()],
             }
         )
         history.append(metrics)

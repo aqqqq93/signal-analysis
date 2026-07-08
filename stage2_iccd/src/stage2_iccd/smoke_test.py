@@ -47,7 +47,8 @@ def main() -> None:
         "snr_db": float(reconstruction_snr_db(batch["clean"], out["reconstruction"]).mean().detach().cpu()),
         "alpha_grad_ok": model.iccd.raw_alpha.grad is not None,
         "refine_grad_ok": any(param.grad is not None for param in model.refine_head.parameters()),
-        "candidate_weights": [float(v) for v in out["candidate_weights"].detach().cpu()],
+        "candidate_weights": [float(v) for v in out["candidate_weights"].detach().mean(dim=0).cpu()],
+        "candidate_temperature": float(out["candidate_temperature"].detach().cpu()),
         "output_shape": list(out["components"].shape),
     }
     print(json.dumps(result, indent=2))

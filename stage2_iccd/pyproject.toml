@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 stage2-train-iccd = "stage2_iccd.train_stage2:main"
 stage2-smoke = "stage2_iccd.smoke_test:main"
+stage2-eval-scenarios = "stage2_iccd.eval_scenarios:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

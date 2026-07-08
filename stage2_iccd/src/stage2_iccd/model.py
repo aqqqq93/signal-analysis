@@ -17,6 +17,8 @@ class Stage2ModelConfig:
     max_refine_hz: float = 35.0
     freq_min: float = 35.0
     freq_max: float = 430.0
+    candidate_temperature: float = 0.02
+    candidate_temperature_min: float = 0.001
 
 
 def stage2_model_config_from_dict(data: dict) -> Stage2ModelConfig:
@@ -27,23 +29,55 @@ def stage2_model_config_from_dict(data: dict) -> Stage2ModelConfig:
         max_refine_hz=float(data.get("max_refine_hz", 35.0)),
         freq_min=float(data.get("freq_min", 35.0)),
         freq_max=float(data.get("freq_max", 430.0)),
+        candidate_temperature=float(data.get("candidate_temperature", 0.02)),
+        candidate_temperature_min=float(data.get("candidate_temperature_min", 0.001)),
     )
 
 
 class CandidateMixer(nn.Module):
-    """Trainable soft selector for top-k IF candidates."""
+    """Soft selector for top-k IF candidates.
 
-    def __init__(self, num_candidates: int):
+    When an ICCD layer and signal are provided, candidates are scored by their
+    preliminary reconstruction residual. This avoids averaging incompatible
+    expert IF tracks. The trainable bias terms still let the model learn a
+    persistent preference for stronger candidate sources.
+    """
+
+    def __init__(self, num_candidates: int, temperature: float, temperature_min: float):
         super().__init__()
         if num_candidates < 1:
             raise ValueError("num_candidates must be at least 1.")
-        self.logits = nn.Parameter(torch.zeros(num_candidates))
+        self.bias = nn.Parameter(torch.zeros(num_candidates))
+        self.raw_temperature = nn.Parameter(_inverse_softplus(torch.tensor(max(temperature - temperature_min, 1.0e-6))))
+        self.temperature_min = float(temperature_min)
 
-    def forward(self, candidate_if_hz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    @property
+    def temperature(self) -> torch.Tensor:
+        return F.softplus(self.raw_temperature) + self.temperature_min
+
+    def forward(
+        self,
+        candidate_if_hz: torch.Tensor,
+        signal: torch.Tensor | None = None,
+        iccd: DifferentiableICCD | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if candidate_if_hz.ndim != 4:
             raise ValueError(f"Expected candidates [B, C, Q, N], got {tuple(candidate_if_hz.shape)}")
-        weights = torch.softmax(self.logits[: candidate_if_hz.shape[1]], dim=0)
-        mixed = (candidate_if_hz * weights.view(1, -1, 1, 1)).sum(dim=1)
+        num_candidates = candidate_if_hz.shape[1]
+        bias = self.bias[:num_candidates]
+        if signal is not None and iccd is not None:
+            residual_scores = []
+            with torch.no_grad():
+                for idx in range(num_candidates):
+                    out = iccd(signal, candidate_if_hz[:, idx])
+                    residual = (out["reconstruction"] - signal).pow(2).mean(dim=-1)
+                    residual_scores.append(residual)
+            residual_score = torch.stack(residual_scores, dim=1)
+            logits = bias.view(1, -1) - residual_score / self.temperature.clamp_min(self.temperature_min)
+            weights = torch.softmax(logits, dim=1)
+        else:
+            weights = torch.softmax(bias, dim=0).view(1, -1).expand(candidate_if_hz.shape[0], -1)
+        mixed = (candidate_if_hz * weights.view(candidate_if_hz.shape[0], num_candidates, 1, 1)).sum(dim=1)
         return mixed, weights
 
 
@@ -82,7 +116,11 @@ class Stage2ICCDModel(nn.Module):
     def __init__(self, iccd_cfg: ICCDConfig, model_cfg: Stage2ModelConfig, num_components: int):
         super().__init__()
         self.model_cfg = model_cfg
-        self.mixer = CandidateMixer(model_cfg.num_candidates)
+        self.mixer = CandidateMixer(
+            model_cfg.num_candidates,
+            temperature=model_cfg.candidate_temperature,
+            temperature_min=model_cfg.candidate_temperature_min,
+        )
         self.refine_head = IFRefinementHead(
             num_components=num_components,
             channels=model_cfg.refine_channels,
@@ -92,7 +130,7 @@ class Stage2ICCDModel(nn.Module):
         self.iccd = DifferentiableICCD(iccd_cfg)
 
     def forward(self, signal: torch.Tensor, candidate_if_hz: torch.Tensor) -> dict[str, torch.Tensor]:
-        initial_if, candidate_weights = self.mixer(candidate_if_hz)
+        initial_if, candidate_weights = self.mixer(candidate_if_hz, signal=signal, iccd=self.iccd)
         delta_if = self.refine_head(signal, initial_if)
         refined_if = (initial_if + delta_if).clamp(float(self.model_cfg.freq_min), float(self.model_cfg.freq_max))
         iccd_out = self.iccd(signal, refined_if)
@@ -102,6 +140,7 @@ class Stage2ICCDModel(nn.Module):
                 "delta_if_hz": delta_if,
                 "refined_if_hz": refined_if,
                 "candidate_weights": candidate_weights,
+                "candidate_temperature": self.mixer.temperature,
             }
         )
         return iccd_out
@@ -120,3 +159,7 @@ def make_smooth_candidate(if_hz: torch.Tensor, kernel_size: int = 31) -> torch.T
         weight.view(1, 1, -1),
     )
     return smoothed.view(bsz, q, n_samples)
+
+
+def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
+    return torch.log(torch.expm1(value).clamp_min(1.0e-8))

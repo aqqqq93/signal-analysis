@@ -32,6 +32,12 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/model.py`: candidate mixer, lightweight IF refinement head, and full stage-2 model.
 - `src/stage2_iccd/candidates.py`: frozen IF-Net candidate provider plus an oracle-perturbed debug provider.
 - `src/stage2_iccd/train_stage2.py`: training loop for the frozen-IF-Net stage.
+- `src/stage2_iccd/eval_scenarios.py`: per-scenario reconstruction and IF evaluation.
+- `results_summary_zh.md`: current Chinese training summary, per-scenario metrics, and next-step diagnosis.
+- `configs/separated_frozen.yaml`: easier separated two-component curriculum before all scenarios.
+- `configs/all_multiexpert.yaml`: all-scenario training with several frozen IF-Net experts as candidate IF sources.
+- `configs/local_jump_frozen.yaml`: focused local-jump stage-2 specialist.
+- `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
 - `configs/default.yaml`: quick debug training with perturbed ground-truth IF candidates.
 - `configs/frozen_ifnet.yaml`: real stage-2 training initialized by a frozen stage-1 checkpoint.
 
@@ -56,6 +62,13 @@ Frozen IF-Net training:
 ```powershell
 $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/frozen_ifnet.yaml
+```
+
+Per-scenario evaluation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/frozen_ifnet/latest.pt --output-dir stage2_iccd/runs/frozen_ifnet/eval_scenarios
 ```
 
 `default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.
