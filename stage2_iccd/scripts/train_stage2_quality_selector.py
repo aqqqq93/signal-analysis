@@ -17,6 +17,7 @@ from ifnet_stage1.simulation import SCENARIOS, ChirpSimulator, sim_config_from_d
 
 from stage2_iccd.eval_active_routed_stage2 import Stage2Bundle
 from stage2_iccd.eval_scenarios import parse_noise_types
+from stage2_iccd.quality_context import QualityContextProvider
 from stage2_iccd.quality_selector import (
     STAGE2_QUALITY_FEATURE_DIM,
     STAGE2_QUALITY_FEATURES,
@@ -40,6 +41,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--hidden", type=int, default=72)
     parser.add_argument("--dropout", type=float, default=0.08)
+    parser.add_argument("--stage1-router-checkpoint", default="ifnet_stage1/runs/router_hard_v3/latest.pt")
+    parser.add_argument("--active-count-checkpoint", default="stage2_iccd/runs/active_count_simple_near_parallel/latest.pt")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--balance-classes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--margin-scale-hz", type=float, default=0.8)
@@ -64,6 +67,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     default = Stage2Bundle(args.default_checkpoint, device)
     specialist = Stage2Bundle(args.specialist_checkpoint, device)
+    context_provider = QualityContextProvider(
+        device=device,
+        stage1_router_checkpoint=args.stage1_router_checkpoint or None,
+        active_count_checkpoint=args.active_count_checkpoint or None,
+    )
     selector_cfg = {"hidden": args.hidden, "dropout": args.dropout}
     selector = Stage2QualitySelector(stage2_quality_selector_config_from_dict(selector_cfg), STAGE2_QUALITY_FEATURE_DIM).to(device)
     optimizer = torch.optim.AdamW(selector.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -76,6 +84,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "specialist_checkpoint": args.specialist_checkpoint,
         "feature_names": STAGE2_QUALITY_FEATURES,
         "feature_dim": STAGE2_QUALITY_FEATURE_DIM,
+        "stage1_router_checkpoint": args.stage1_router_checkpoint,
+        "active_count_checkpoint": args.active_count_checkpoint,
         "quality_selector": selector_cfg,
         "data": {
             "scenarios": args.scenarios,
@@ -100,7 +110,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     pbar = trange(1, args.steps + 1, desc="stage2-quality-selector")
     for step in pbar:
         batch = simulator.generate_batch(args.batch_size, device=device)
-        features, labels, branch_mae = build_selector_batch(default, specialist, batch, device)
+        features, labels, branch_mae = build_selector_batch(default, specialist, batch, device, context_provider=context_provider)
         selector.train()
         logits = selector(features)
         loss = weighted_selector_loss(logits, labels, branch_mae, balance_classes=args.balance_classes, margin_scale_hz=args.margin_scale_hz)
@@ -129,7 +139,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         pbar.set_postfix(loss=f"{row['loss']:.3f}", acc=f"{row['accuracy']:.2f}", mae=f"{row['selected_if_mae_hz']:.2f}")
 
         if step % args.print_every == 0 or step == args.steps:
-            val = evaluate_selector(selector, default, specialist, simulator, args.batch_size, args.val_batches, device)
+            val = evaluate_selector(selector, default, specialist, simulator, args.batch_size, args.val_batches, device, context_provider)
             row.update({f"val_{key}": value for key, value in val.items()})
             with (run_dir / "history.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
@@ -148,10 +158,19 @@ def build_selector_batch(
     specialist: Stage2Bundle,
     batch: dict[str, Any],
     device: torch.device,
+    context_provider: QualityContextProvider | None = None,
+    feature_names: tuple[str, ...] = STAGE2_QUALITY_FEATURES,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     out_default = default.run(batch)
     out_specialist = specialist.run(batch)
-    features = stage2_quality_features(out_default, out_specialist, batch["signal"]).to(device)
+    context = context_provider(batch["signal"]) if context_provider is not None else None
+    features = stage2_quality_features(
+        out_default,
+        out_specialist,
+        batch["signal"],
+        context=context,
+        feature_names=feature_names,
+    ).to(device)
     default_mae = per_sample_if_mae(out_default["refined_if_hz"], batch["if_hz"], batch.get("active_mask"))
     specialist_mae = per_sample_if_mae(out_specialist["refined_if_hz"], batch["if_hz"], batch.get("active_mask"))
     branch_mae = torch.stack([default_mae, specialist_mae], dim=1).to(device)
@@ -168,12 +187,13 @@ def evaluate_selector(
     batch_size: int,
     batches: int,
     device: torch.device,
+    context_provider: QualityContextProvider | None = None,
 ) -> dict[str, float]:
     selector.eval()
     rows = []
     for _ in range(batches):
         batch = simulator.generate_batch(batch_size, device=device)
-        features, labels, branch_mae = build_selector_batch(default, specialist, batch, device)
+        features, labels, branch_mae = build_selector_batch(default, specialist, batch, device, context_provider=context_provider)
         logits = selector(features)
         probs = torch.softmax(logits, dim=1)
         pred = logits.argmax(dim=1)

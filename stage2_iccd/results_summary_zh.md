@@ -834,3 +834,110 @@ checkpoint：`stage2_iccd/runs/simple_single_component/latest.pt`
 3. 接入 Stage1 的 jump auxiliary 输出，开始训练 `jump_mask` 条件化的 local_jump refinement；
 4. 等 quality selector 能稳定超过 specialist 或至少稳定降低 p95，再把它接入默认 routed Stage2；
 5. 最后再推进相位通道或多专家软融合，因为这两项会牵动 Stage1/Stage2 输入结构，改动范围更大。
+
+## 16. 2026-07-09 补充：P0 后半段完成情况
+
+本轮继续完成上一节列出的两个 P0 后半段任务：
+
+1. 扩展 supervised quality selector 的输入特征，并重新训练；
+2. 对 active-component loss 做更长训练，单独评估 single active 输入下 inactive component energy 是否真正下降。
+
+### 16.1 quality selector 特征扩展
+
+上一版 quality selector 主要依赖 Stage2 两个分支自己的输出，例如重构残差、IF 平滑度、候选权重熵等。这些特征能描述“当前分支看起来是否平滑、是否重构得好”，但缺少上游路由和分量数量信息。因此本轮新增了 `stage2_iccd/src/stage2_iccd/quality_context.py`，把两个额外上下文接入 quality selector：
+
+- Stage1 hard router：读取 `ifnet_stage1/runs/router_hard_v3/latest.pt`，输出 top-1 置信度、top-2 margin，以及 poly / sinusoidal / cross / jump 四类概率；
+- active-count router：读取 `stage2_iccd/runs/active_count_simple_near_parallel/latest.pt`，输出 active-count 置信度、margin 和 two-component 概率。
+
+同时，在 `stage2_iccd/src/stage2_iccd/quality_selector.py` 中新增了两类几何特征：
+
+- 身份一致性特征：两条 refined IF 的交叉翻转率、最小分量间隔，以及两个分支之间的差值；
+- 局部曲率突变特征：二阶差分最大值与平均值的比值，用来提示局部突变或局部异常弯折。
+
+扩展后，quality selector 的特征从原来的 24 维增加到 42 维。为了兼容旧 checkpoint，代码没有强制所有模型都使用 42 维，而是把 `feature_names` 存进 checkpoint。评估时会按 checkpoint 记录的特征名重新构造输入，因此旧的 24 维 selector 仍能评估。
+
+### 16.2 扩展特征后的质量选择结果
+
+训练命令使用：
+
+```powershell
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\train_stage2_quality_selector.py --run-dir stage2_iccd/runs/stage2_quality_selector_p0_context --steps 800 --batch-size 8 --val-batches 28 --hidden 96 --dropout 0.10 --balance-classes --margin-scale-hz 0.65
+```
+
+独立评估 `best.pt` 的结果如下：
+
+| 选择方式 | IF MAE mean / Hz | IF MAE p90 / Hz | IF MAE p95 / Hz | 使用专项分支比例 | 选择准确率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default | 2.285 | 4.106 | 9.135 | 0.0% | - |
+| specialist | 2.211 | 3.936 | 9.071 | 100.0% | - |
+| selected best | 2.210 | 3.936 | 9.071 | 99.7% | 66.7% |
+| oracle | 2.167 | 3.936 | 9.063 | 66.3% | 100.0% |
+
+独立评估 `latest.pt` 的结果如下：
+
+| 选择方式 | IF MAE mean / Hz | IF MAE p90 / Hz | IF MAE p95 / Hz | 使用专项分支比例 | 选择准确率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default | 2.285 | 4.106 | 9.135 | 0.0% | - |
+| specialist | 2.211 | 3.936 | 9.071 | 100.0% | - |
+| selected latest | 2.226 | 3.999 | 9.093 | 58.1% | 62.6% |
+| oracle | 2.167 | 3.936 | 9.063 | 66.3% | 100.0% |
+
+这个结果说明，扩展特征确实让模型具备了更丰富的判断依据，但当前质量选择头仍然没有形成足够强的默认替代能力。`latest.pt` 能避免塌缩，但均值比 specialist 差；`best.pt` 均值略微好于 specialist，但几乎总是选择 specialist，说明它更像一个“专项优先、默认极少兜底”的策略，而不是真正稳定的二分支质量判别器。
+
+因此，P0 的质量头部分目前可以认为“工程闭环完成”，但“不进入默认推理”。它的价值是：
+
+- 代码路径已经支持 Stage1 top-2 置信度、active-count 置信度、身份一致性和局部曲率突变；
+- 可以作为后续多专家软融合或更强质量判别器的基础；
+- 暂时不能作为替代 `simple_multicomponent_long` 或 `poly_multicomponent_refine` 的默认决策器。
+
+### 16.3 active-component loss 的长训与单分量泄漏
+
+本轮先直接用 `simple_active_mixed.yaml` 训练了一个较强版本：
+
+- run dir：`stage2_iccd/runs/simple_active_mixed_active_loss_p0`
+- 训练后 single active 的 inactive_component_mse 从基线 `0.0792` 降到 `0.0146`
+- 但 two active 的 IF MAE 从基线 `1.537 Hz` 退化到 `2.659 Hz`
+
+这个版本说明 active loss 方向有效，但惩罚太强会伤害正常双分量。因此又新增了一个更保守的配置：
+
+- `stage2_iccd/configs/simple_active_mixed_p0_conservative.yaml`
+
+保守版做了几件事：
+
+- single active 采样比例从 45% 降到 35%，保留更多双分量样本；
+- inactive_component 权重降到 `0.04`；
+- `max_refine_hz` 从 24 Hz 降到 18 Hz；
+- smooth 和 delta 正则增强，避免 refinement head 过度弯折。
+
+独立评估结果如下。
+
+| 模型 | active=1 inactive MSE | active=1 IF MAE / Hz | active=2 IF MAE / Hz | active=2 SNR / dB |
+| --- | ---: | ---: | ---: | ---: |
+| simple_multicomponent_long 基线 | 0.0792 | 1.376 | 1.537 | 25.74 |
+| active_loss 强版本 | 0.0146 | 1.298 | 2.659 | 23.72 |
+| active_loss 保守版 | 0.0288 | 0.770 | 1.912 | 25.19 |
+
+保守版的结论更合理：它没有把 inactive energy 压到最低，但相比基线仍下降约 64%；同时 single active IF MAE 明显改善，从 `1.376 Hz` 降到 `0.770 Hz`。代价是双分量 IF MAE 仍有一定退化，从 `1.537 Hz` 上升到 `1.912 Hz`。
+
+因此，active-component loss 的结论是：
+
+1. 单分量泄漏确实被 active loss 明显压低；
+2. 如果把 mixed active checkpoint 直接替换双分量主模型，会伤害双分量；
+3. 更合适的用法是让 active-count router 先判断分量数量：single active 或泄漏风险场景走 active-loss / single 分支，two active 仍走 `simple_multicomponent_long`。
+
+### 16.4 P0 当前完成判断
+
+到这里，P0 可以认为已经完成当前阶段的闭环：
+
+- supervised quality selector 已经扩展到 42 维特征，并完成重新训练和独立评估；
+- active-component loss 已经长训，并明确量化了 single active 收益与 two active 代价；
+- jump 条件输入接口已经预留，后续可以接 Stage1 jump auxiliary；
+- 质量头和 active loss 都没有盲目设为默认策略，而是保留为可控的诊断/路由分支。
+
+当前默认建议仍然是：
+
+- 单分量：继续优先使用 `simple_single_component`，active-loss 保守版作为泄漏抑制参考；
+- 双分量：继续使用 `simple_multicomponent_long`；
+- 多项式专项：保留 `poly_multicomponent_refine` 作为候选，不直接默认替换；
+- quality selector：保留 `stage2_quality_selector_p0_context`，用于后续多专家融合和 hard-sample 诊断；
+- 下一阶段再处理 P1：分段 refinement、多专家软融合、端到端分层解冻。

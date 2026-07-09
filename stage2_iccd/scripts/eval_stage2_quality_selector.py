@@ -14,6 +14,7 @@ from ifnet_stage1.simulation import SCENARIOS, ChirpSimulator, sim_config_from_d
 
 from stage2_iccd.eval_active_routed_stage2 import Stage2Bundle
 from stage2_iccd.eval_scenarios import parse_noise_types
+from stage2_iccd.quality_context import QualityContextProvider
 from stage2_iccd.quality_selector import (
     Stage2QualitySelector,
     stage2_quality_selector_config_from_dict,
@@ -26,6 +27,8 @@ def main() -> None:
     parser.add_argument("--selector-checkpoint", default="stage2_iccd/runs/stage2_quality_selector_poly/latest.pt")
     parser.add_argument("--default-checkpoint", default=None)
     parser.add_argument("--specialist-checkpoint", default=None)
+    parser.add_argument("--stage1-router-checkpoint", default=None)
+    parser.add_argument("--active-count-checkpoint", default=None)
     parser.add_argument("--output-dir", default="stage2_iccd/runs/stage2_quality_selector_poly/eval")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--scenarios", nargs="*", default=["linear", "quadratic", "cubic", "near_parallel"])
@@ -49,6 +52,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     cfg = ckpt["config"]
     default_checkpoint = args.default_checkpoint or cfg["default_checkpoint"]
     specialist_checkpoint = args.specialist_checkpoint or cfg["specialist_checkpoint"]
+    feature_names = tuple(ckpt.get("feature_names", cfg.get("feature_names", [])))
+    if not feature_names:
+        feature_names = tuple(cfg.get("feature_names", []))
     selector = Stage2QualitySelector(
         stage2_quality_selector_config_from_dict(cfg.get("quality_selector")),
         int(ckpt.get("feature_dim", cfg.get("feature_dim", 24))),
@@ -57,6 +63,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     selector.eval()
     default = Stage2Bundle(default_checkpoint, device)
     specialist = Stage2Bundle(specialist_checkpoint, device)
+    context_provider = QualityContextProvider(
+        device=device,
+        stage1_router_checkpoint=args.stage1_router_checkpoint or cfg.get("stage1_router_checkpoint") or None,
+        active_count_checkpoint=args.active_count_checkpoint or cfg.get("active_count_checkpoint") or None,
+    )
 
     rows = []
     summaries = {}
@@ -72,7 +83,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         scenario_rows = []
         for batch_idx in range(args.batches):
             batch = simulator.generate_batch(args.batch_size, device=device)
-            features, labels, branch_mae = build_selector_batch(default, specialist, batch, device)
+            features, labels, branch_mae = build_selector_batch(
+                default,
+                specialist,
+                batch,
+                device,
+                context_provider=context_provider,
+                feature_names=feature_names,
+            )
             logits = selector(features)
             probs = torch.softmax(logits, dim=1)
             pred = logits.argmax(dim=1)

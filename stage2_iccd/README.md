@@ -33,6 +33,7 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/candidates.py`: frozen IF-Net candidate provider plus an oracle-perturbed debug provider.
 - `src/stage2_iccd/train_stage2.py`: training loop for the frozen-IF-Net stage.
 - `src/stage2_iccd/quality_selector.py`: supervised branch-quality selector used to compare default and specialist stage-2 branches.
+- `src/stage2_iccd/quality_context.py`: optional Stage1 router and active-count confidence features for the supervised quality selector.
 - `src/stage2_iccd/eval_scenarios.py`: per-scenario reconstruction and IF evaluation.
 - `src/stage2_iccd/active_count.py`: lightweight active-component count classifier.
 - `src/stage2_iccd/train_active_count.py`: active-count router training.
@@ -56,6 +57,7 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `configs/balanced_multicomponent_refine.yaml`: balanced two-component refinement probe; diagnostic only because it regressed on several robust cases.
 - `configs/simple_single_component.yaml`: active-component masked single-component training.
 - `configs/simple_active_mixed.yaml`: mixed one/two active-component probe; diagnostic only, not the current best.
+- `configs/simple_active_mixed_p0_conservative.yaml`: conservative active-mask training recipe that reduces single-component leakage while limiting two-component regression.
 - `configs/all_multiexpert.yaml`: all-scenario training with several frozen IF-Net experts as candidate IF sources.
 - `configs/local_jump_frozen.yaml`: focused local-jump stage-2 specialist.
 - `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
@@ -143,6 +145,22 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
 .\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\eval_stage2_quality_selector.py --selector-checkpoint stage2_iccd/runs/stage2_quality_selector_poly_balanced/best.pt --output-dir stage2_iccd/runs/stage2_quality_selector_poly_balanced/eval_best
 ```
 
+P0 context-aware quality-selector training:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\train_stage2_quality_selector.py --run-dir stage2_iccd/runs/stage2_quality_selector_p0_context --steps 800 --batch-size 8 --val-batches 28 --hidden 96 --dropout 0.10 --balance-classes --margin-scale-hz 0.65
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\eval_stage2_quality_selector.py --selector-checkpoint stage2_iccd/runs/stage2_quality_selector_p0_context/best.pt --output-dir stage2_iccd/runs/stage2_quality_selector_p0_context/eval_best
+```
+
+Conservative active-mask training and single-active evaluation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/simple_active_mixed_p0_conservative.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/simple_active_mixed_p0_conservative/latest.pt --output-dir stage2_iccd/runs/simple_active_mixed_p0_conservative/eval_single_active --scenarios linear quadratic cubic near_parallel --active-components 1
+```
+
 Reference-style external signal analysis:
 
 ```powershell
@@ -164,4 +182,4 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 
 - Active-component component loss now uses the ground-truth active mask before component matching and adds an inactive-slot energy penalty. This prevents a one-component signal from being silently split across two reconstructed output slots.
 - `Stage2ModelConfig.refine_extra_channels` and `Stage2ICCDModel.forward(..., refinement_extra=...)` reserve a clean interface for later `jump_mask` or `jump_prob` conditioning. The default remains zero extra channels, so existing checkpoints keep loading normally.
-- The supervised quality selector is implemented as a lightweight MLP over deployment-safe branch features: reconstruction residuals, branch residual ratios, IF difference statistics, smoothness, range, curvature, and candidate entropy. It is currently a diagnostic branch chooser, not yet the default production route.
+- The supervised quality selector is implemented as a lightweight MLP over deployment-safe branch features: reconstruction residuals, branch residual ratios, IF difference statistics, smoothness, range, curvature, candidate entropy, Stage1 router confidence, active-count confidence, identity-consistency cues, and local curvature-jump cues. It is currently a diagnostic branch chooser, not yet the default production route.
