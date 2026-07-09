@@ -37,12 +37,16 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/train_active_count.py`: active-count router training.
 - `src/stage2_iccd/eval_active_count.py`: active-count router evaluation.
 - `src/stage2_iccd/eval_active_routed_stage2.py`: routed stage-2 evaluation using the active-count router.
+- `scripts/plot_old_new_stage2_comparison.py`: visual comparison between an older checkpoint and the current routed stage-2 output.
+- `scripts/compare_stage2_checkpoints.py`: sample-wise IF/SNR comparison between two stage-2 checkpoints.
 - `results_summary_zh.md`: current Chinese training summary, per-scenario metrics, and next-step diagnosis.
 - `configs/active_count_simple.yaml`: active-count router for linear/quadratic/cubic one-vs-two active components.
 - `configs/active_count_simple_near_parallel.yaml`: active-count router extended with near_parallel samples.
 - `configs/separated_frozen.yaml`: easier separated two-component curriculum before all scenarios.
 - `configs/simple_multicomponent_long.yaml`: longer simple separated two-component training; current best simple checkpoint source.
 - `configs/simple_multicomponent_robust.yaml`: robustness probe for simple separated signals; useful for diagnosis, not the current best.
+- `configs/poly_multicomponent_refine.yaml`: polynomial two-component refinement probe; diagnostic specialist, not the default checkpoint.
+- `configs/balanced_multicomponent_refine.yaml`: balanced two-component refinement probe; diagnostic only because it regressed on several robust cases.
 - `configs/simple_single_component.yaml`: active-component masked single-component training.
 - `configs/simple_active_mixed.yaml`: mixed one/two active-component probe; diagnostic only, not the current best.
 - `configs/all_multiexpert.yaml`: all-scenario training with several frozen IF-Net experts as candidate IF sources.
@@ -107,6 +111,13 @@ Routed stage-2 evaluation:
 ```powershell
 $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_active_routed_stage2 --active-checkpoint stage2_iccd/runs/active_count_simple_near_parallel/latest.pt --single-checkpoint stage2_iccd/runs/simple_single_component/latest.pt --multi-checkpoint stage2_iccd/runs/simple_multicomponent_long/latest.pt --output-dir stage2_iccd/runs/active_count_simple_near_parallel/eval_routed_easy --scenarios linear quadratic cubic near_parallel --active-components 1 2
+```
+
+Checkpoint-vs-checkpoint diagnostic comparison:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\compare_stage2_checkpoints.py --scenario quadratic --num-samples 160 --output-dir stage2_iccd/runs/poly_multicomponent_refine/compare_quadratic_easy
 ```
 
 `default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.

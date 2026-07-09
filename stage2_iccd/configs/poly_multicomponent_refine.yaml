@@ -1,0 +1,66 @@
+seed: 20260715
+device: auto
+run_dir: stage2_iccd/runs/poly_multicomponent_refine
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  active_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: 0.0
+  snr_db_max: 28.0
+  scenario_weights:
+    linear: 0.5
+    quadratic: 2.2
+    cubic: 1.8
+    sinusoidal_fm: 0.0
+    crossing: 0.0
+    near_parallel: 0.4
+    local_jump: 0.0
+    tangent_or_overlap: 0.0
+  noise_types:
+    white: 0.65
+    colored: 0.25
+    impulsive: 0.04
+    trend: 0.06
+
+init:
+  mode: frozen_ifnet_checkpoint
+  num_candidates: 2
+  smooth_kernel: 31
+  checkpoint: ifnet_stage1/runs/balanced_refit_resume/latest.pt
+
+iccd:
+  amplitude_order: 8
+  period_factor: 2.0
+  alpha_init: 1.0
+  alpha_min: 0.00001
+  solve_jitter: 0.000001
+
+model:
+  num_candidates: 2
+  refine_channels: 32
+  refine_layers: 3
+  max_refine_hz: 35.0
+  candidate_temperature: 0.02
+  candidate_temperature_min: 0.001
+
+train:
+  resume: stage2_iccd/runs/simple_multicomponent_long/latest.pt
+  steps: 900
+  batch_size: 8
+  lr: 0.00008
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 300
+  val_batches: 6
+  loss:
+    reconstruction: 1.0
+    component: 0.22
+    if_l1: 0.12
+    smooth: 0.0012
+    delta: 0.0006
+    candidate_entropy: 0.0003

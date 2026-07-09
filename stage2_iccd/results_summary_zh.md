@@ -505,3 +505,113 @@ checkpoint：`stage2_iccd/runs/simple_single_component/latest.pt`
 4. 最后集中处理 local_jump，加入跳变位置辅助头、jump mask 或分段 refinement。
 
 因此，本轮结论是：简单单/双分量和 near_parallel 的 Stage2 路由框架已经基本打通，可以继续往 sinusoidal_fm 扩展；但 crossing/local_jump 仍应作为后续专项攻克对象。
+
+## 13. 2026-07-09 补充：多项式双分量尾部误差专项优化
+
+在重新生成“旧模型 vs 新模型”的可视化图之后，可以看到当前第二阶段已经能让多数简单单分量、简单双分量和 near_parallel 的曲线更接近真实 IF。但有一个比较明显的弱点：`quadratic active=2` 这类双分量多项式信号仍然存在尾部误差。也就是说，平均效果已经不错，但某些样本的局部弯曲、端点区域或两分量接近区域会出现偏离。
+
+这类问题和 crossing/local_jump 不完全一样。crossing 的核心问题是身份交换，local_jump 的核心问题是跳变点定位；而 `quadratic/cubic active=2` 的主要问题是连续曲线的弯曲形状和双分量间距同时变化，第二阶段如果只按普通 separated 双分量训练，容易学到比较平滑、保守的修正，无法完全覆盖多项式尾部样本。
+
+### 13.1 本轮新增的诊断工具
+
+本轮新增了一个样本级 checkpoint 对比脚本：
+
+- `stage2_iccd/scripts/compare_stage2_checkpoints.py`
+
+它的作用是让两个 Stage2 checkpoint 在同一批仿真样本上逐个比较，而不是只看一次汇总平均值。脚本会输出：
+
+- 两个 checkpoint 的 IF MAE 均值、中位数、p90、p95；
+- 重构 SNR 均值；
+- 新 checkpoint 相比旧 checkpoint 的逐样本胜率；
+- `comparison.json` 和 `comparison.csv`，方便后续定位“哪些样本被改善，哪些样本被恶化”。
+
+这个脚本很重要，因为当前任务不能只看平均值。如果某个模型平均值略好，但 p90/p95 或其他场景明显变差，它就不适合作为默认模型。
+
+### 13.2 多项式专项双分量模型
+
+首先训练了 `poly_multicomponent_refine`，配置文件为：
+
+- `stage2_iccd/configs/poly_multicomponent_refine.yaml`
+
+这个模型从当前简单双分量稳定 checkpoint 继续训练：
+
+- 初始化 checkpoint：`stage2_iccd/runs/simple_multicomponent_long/latest.pt`；
+- 固定为 2 active components；
+- 加大 `quadratic` 和 `cubic` 的采样权重；
+- 保留少量 `linear` 和 `near_parallel`，避免模型完全只记住多项式样本；
+- 适当放宽 IF refinement 幅度，让模型能修正更大的局部偏差。
+
+训练后的分场景评估如下。
+
+| 条件 | linear IF MAE / Hz | quadratic IF MAE / Hz | cubic IF MAE / Hz | near_parallel IF MAE / Hz | 平均 IF MAE / Hz | SNR / dB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| easy | 1.01 | 1.70 | 2.10 | 1.03 | 1.46 | 25.76 |
+| robust | 3.99 | 2.47 | 3.50 | 1.36 | 2.83 | 22.58 |
+
+从这个表可以看出，`poly_multicomponent_refine` 对多项式双分量确实有帮助，但它不是一个适合直接替换默认模型的结果。原因是 robust 条件下 `linear` 明显退化，IF MAE 到了约 3.99 Hz。这说明它学到了更偏向弯曲多项式的修正策略，对线性双分量不够稳。
+
+为了更公平地判断它是否真的改善 `quadratic active=2`，又做了 160 个样本的逐样本对比。对比对象是当前默认双分量模型 `simple_multicomponent_long`。
+
+| 条件 | 默认模型 mean / Hz | 多项式专项 mean / Hz | 默认模型 p95 / Hz | 多项式专项 p95 / Hz | 专项模型胜率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| quadratic easy | 1.60 | 1.57 | 4.89 | 4.72 | 60.0% |
+| quadratic robust | 2.37 | 2.32 | 8.84 | 8.65 | 65.6% |
+
+这个结果说明：多项式专项模型确实能略微降低 `quadratic active=2` 的平均误差和 p95 误差，而且超过一半样本会变好。但改善幅度还不够大，p90 在 robust 条件下甚至有轻微变差。因此它目前更适合作为“诊断模型”或后续 hard-sample mining 的起点，而不是默认模型。
+
+### 13.3 均衡双分量微调尝试
+
+为了避免多项式专项模型牺牲 linear，本轮又训练了一个更均衡的模型：
+
+- `stage2_iccd/configs/balanced_multicomponent_refine.yaml`
+
+它仍然从 `simple_multicomponent_long/latest.pt` 继续训练，但不再过度偏向 `quadratic/cubic`，而是在 linear、quadratic、cubic、near_parallel 之间做相对温和的采样平衡。
+
+评估结果如下。
+
+| 条件 | linear IF MAE / Hz | quadratic IF MAE / Hz | cubic IF MAE / Hz | near_parallel IF MAE / Hz | 平均 IF MAE / Hz | SNR / dB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| easy | 1.44 | 1.87 | 1.89 | 1.15 | 1.59 | 25.82 |
+| robust | 2.85 | 3.22 | 3.13 | 1.80 | 2.75 | 22.58 |
+
+这个结果没有超过当前默认双分量模型。它对 easy 条件下的 cubic 有一点帮助，但 linear、quadratic、near_parallel 和 robust 条件整体变差。因此 `balanced_multicomponent_refine` 也不应作为默认模型。
+
+### 13.4 当前采用的模型选择
+
+本轮优化后的结论是：目前最稳的默认组合仍然保持不变。
+
+- 单分量：`stage2_iccd/runs/simple_single_component/latest.pt`
+- 简单双分量与 near_parallel：`stage2_iccd/runs/simple_multicomponent_long/latest.pt`
+- active-count 路由器：`stage2_iccd/runs/active_count_simple_near_parallel/latest.pt`
+
+新增的两个模型不删除，但暂时作为诊断和后续研究材料保留：
+
+- `stage2_iccd/runs/poly_multicomponent_refine/latest.pt`：多项式双分量专项模型，能轻微改善 quadratic 尾部，但会损害 robust linear；
+- `stage2_iccd/runs/balanced_multicomponent_refine/latest.pt`：均衡微调模型，没有超过默认双分量模型。
+
+### 13.5 为什么继续盲目训练不一定有效
+
+这轮实验说明，当前问题不只是“训练不够久”。如果简单延长训练或提高某一类样本权重，模型会在某些样本上改善，但容易把别的场景拉坏。根本原因可能有三点：
+
+1. Stage2 的 IF refinement head 仍然比较轻量，面对二次/三次多项式的局部曲率变化时，表达能力有限；
+2. Stage1 提供的 top-k 候选如果在困难样本里已经偏离真实 IF，Stage2 只能在有限范围内修正，不能凭空恢复完全正确的分量形状；
+3. 当前 active-count 路由器只能判断 1/2 active components，不能区分 linear、quadratic、cubic 这样的多项式子类型，因此不能安全地把多项式专项模型只分配给真正需要它的样本。
+
+因此，下一步更合理的优化方向不是直接替换默认模型，而是做“质量感知”的分支选择：
+
+- 给 Stage2 增加候选置信度或重构残差门控；
+- 对 `quadratic/cubic active=2` 的高误差样本做 hard-sample mining；
+- 训练一个轻量 subtype / quality gate，用来判断样本是否需要走多项式专项分支；
+- 继续保留当前默认双分量模型作为基线，任何新模型必须同时比较 mean、p90、p95 和跨场景退化情况。
+
+### 13.6 对进入下一步的影响
+
+这轮结果不会阻止进入后续第二阶段工作。原因是第二阶段的目标不是让初始 IF 完全贴合真实脊线，而是提供一个足够可靠的初始估计，让可微 ICCD 展开层能够稳定重构并反向微调。当前单分量、简单双分量和 near_parallel 已经满足这个要求。
+
+但对于困难多分量多项式样本，需要注意：
+
+- 如果只是做重构，当前默认模型已经基本可用；
+- 如果要求 IF 曲线在图上非常贴近真实曲线，`quadratic/cubic active=2` 的尾部样本仍需要继续优化；
+- 如果后续进入 crossing/local_jump，不能把这类误差简单归因于 ICCD 层，而要同时检查 Stage1 候选质量、身份一致性、跳变位置辅助头和路由稳定性。
+
+所以当前阶段的建议是：默认流程继续使用稳定组合；多项式专项模型作为备选诊断分支保留；下一步优先做候选质量/置信度门控和 hard-sample mining，再继续扩展到 sinusoidal_fm、crossing 和 local_jump。
