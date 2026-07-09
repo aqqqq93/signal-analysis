@@ -39,6 +39,9 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/eval_active_routed_stage2.py`: routed stage-2 evaluation using the active-count router.
 - `scripts/plot_old_new_stage2_comparison.py`: visual comparison between an older checkpoint and the current routed stage-2 output.
 - `scripts/compare_stage2_checkpoints.py`: sample-wise IF/SNR comparison between two stage-2 checkpoints.
+- `scripts/evaluate_stage2_quality_gate.py`: diagnostic gate between the default and polynomial-specialist stage-2 checkpoints.
+- `scripts/sweep_stage2_quality_gate.py`: offline sweep for quality-gate score penalties and margins.
+- `scripts/build_stage2_summary_pdf.py`: rebuilds `output/pdf/stage2_iccd_summary.pdf` from `results_summary_zh.md`.
 - `results_summary_zh.md`: current Chinese training summary, per-scenario metrics, and next-step diagnosis.
 - `configs/active_count_simple.yaml`: active-count router for linear/quadratic/cubic one-vs-two active components.
 - `configs/active_count_simple_near_parallel.yaml`: active-count router extended with near_parallel samples.
@@ -118,6 +121,20 @@ Checkpoint-vs-checkpoint diagnostic comparison:
 ```powershell
 $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
 .\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\compare_stage2_checkpoints.py --scenario quadratic --num-samples 160 --output-dir stage2_iccd/runs/poly_multicomponent_refine/compare_quadratic_easy
+```
+
+Quality-gate diagnostic and sweep:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\evaluate_stage2_quality_gate.py --output-dir stage2_iccd/runs/poly_multicomponent_refine/quality_gate_easy --num-samples 80
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\sweep_stage2_quality_gate.py --csv stage2_iccd/runs/poly_multicomponent_refine/quality_gate_easy/quality_gate.csv --output-json stage2_iccd/runs/poly_multicomponent_refine/quality_gate_easy/sweep.json
+```
+
+Rebuild the Chinese PDF summary:
+
+```powershell
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\build_stage2_summary_pdf.py
 ```
 
 `default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.
