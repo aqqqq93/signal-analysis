@@ -725,3 +725,112 @@ checkpoint：`stage2_iccd/runs/simple_single_component/latest.pt`
 但从这一轮开始，后续优化方向已经从“继续训练一个更大的统一模型”转为“带质量感知的多分支选择”。这和后续处理 crossing/local_jump 的思路是一致的：困难样本不一定靠一个模型硬吃掉，而是先保留多个候选，再用置信度、身份一致性、跳变位置或重构质量来决定如何进入可微 ICCD 展开层。
 
 因此，下一步建议优先实现 supervised quality head，并把它接到 routed Stage2 评估中。只有当 quality head 能稳定超过手工门控和永远使用专项分支，才把多项式专项分支纳入默认推理流程。
+
+## 15. 2026-07-09 补充：按 P0 优先级落地的第一轮优化
+
+本轮按照“先补关键信息通道和质量判断，再继续大改结构”的原则推进。由于当前 Stage2 的主干已经能稳定做重构，改动重点没有放在重新训练一个更大的网络，而是放在四个更靠近问题根源的位置：
+
+1. 用监督式质量选择头替代纯手工门控；
+2. 在 component loss 中显式处理 active / inactive 分量，减少单分量泄漏；
+3. 给 Stage2 refinement head 预留 `jump_mask` 或 `jump_prob` 条件输入；
+4. 在质量选择头训练中加入类别均衡和难例权重，避免选择器塌缩成“永远选某一个分支”。
+
+### 15.1 监督式 Stage2 质量选择头
+
+新增代码：
+
+- `stage2_iccd/src/stage2_iccd/quality_selector.py`
+- `stage2_iccd/scripts/train_stage2_quality_selector.py`
+- `stage2_iccd/scripts/eval_stage2_quality_selector.py`
+
+这个质量选择头的目标不是判断信号类型，而是判断“默认双分量分支”和“多项式专项分支”哪一个在当前样本上更可靠。训练标签由仿真数据自动生成：同一个样本同时经过两个 Stage2 分支，然后计算它们各自相对真实 IF 的 MAE，误差更小的分支作为监督标签。
+
+输入特征没有使用真实 IF，因此未来推理时也能获得。当前使用的特征包括：
+
+- 默认分支和专项分支的重构残差；
+- 两个分支重构残差的差值与比例；
+- 两个分支 refined IF 的差异统计量；
+- IF 曲线的范围、斜率、平滑度和曲率；
+- 候选权重熵，用来粗略表示候选 IF 的不确定性；
+- 两个分支输出之间的整体偏离程度。
+
+第一版直接训练时出现了一个问题：选择器倾向于永远选择多项式专项分支。独立评估结果如下：
+
+| 选择方式 | IF MAE mean / Hz | IF MAE p90 / Hz | IF MAE p95 / Hz | 使用专项分支比例 |
+| --- | ---: | ---: | ---: | ---: |
+| default | 2.294 | 3.997 | 9.296 | 0.0% |
+| specialist | 2.218 | 3.907 | 9.288 | 100.0% |
+| selected | 2.218 | 3.907 | 9.288 | 100.0% |
+| oracle | 2.175 | 3.830 | 9.158 | 66.3% |
+
+这说明监督标签本身不是问题，问题在于标签分布和分支差异都偏向专项分支，普通交叉熵很容易学成“只选专项”。因此我又加入了两项修正：
+
+- 类别均衡：在一个 batch 内自动提高少数类标签的权重；
+- margin 加权：两个分支 MAE 差距越大的样本权重越高，差距很小的样本权重降低。
+
+平衡训练后的 `best.pt` 独立评估如下：
+
+| 选择方式 | IF MAE mean / Hz | IF MAE p90 / Hz | IF MAE p95 / Hz | 使用专项分支比例 | 选择准确率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default | 2.294 | 3.997 | 9.296 | 0.0% | - |
+| specialist | 2.218 | 3.907 | 9.288 | 100.0% | - |
+| selected | 2.221 | 3.907 | 9.288 | 79.6% | 65.3% |
+| oracle | 2.175 | 3.830 | 9.158 | 66.3% | 100.0% |
+
+这个结果比第一版健康，因为它不再永远选择同一个分支，并且 near_parallel 场景下 selected 的均值略好于 specialist。但从整体均值看，它仍然没有稳定超过“永远使用专项分支”。因此当前结论是：监督式 quality head 的代码路径已经打通，可以作为诊断和后续融合基础；但它暂时不应该替代默认推理策略。
+
+### 15.2 active-component loss 与单分量泄漏
+
+原来的 Stage2 已经在 IF loss 中使用了 active mask，也就是说真实不存在的分量不会强迫 IF 贴近某条伪曲线。但 component reconstruction loss 之前没有充分利用 active mask，这会带来一个隐患：当输入只有一个真实分量时，双分量模型可能把这个真实分量拆到两个输出槽里，看起来总重构还不错，但分量解释是错的。
+
+本轮在 `stage2_iccd/src/stage2_iccd/losses.py` 中新增了：
+
+- `active_component_permutation_mse`
+- `active_component_permutation_l1`
+
+它们先根据 active mask 做分量匹配，只对真实活跃分量计算主要匹配误差；同时对未匹配的 inactive 输出槽增加能量惩罚。这样模型不能再通过“多生成一条弱分量”来逃避单分量约束。
+
+短训练探针已经验证新增指标可以正常进入训练日志：
+
+| 指标 | 探针结果 |
+| --- | ---: |
+| `if_mae_hz` | 1.109 Hz |
+| `rec_snr_db` | 28.48 dB |
+| `component_mse` | 0.0619 |
+| `inactive_component_mse` | 0.0546 |
+
+这只是 smoke 级验证，说明代码路径正常，不等价于已经把单分量泄漏彻底压到目标值以下。后续需要做更长训练，并单独统计 single active 输入下的 inactive component energy。
+
+### 15.3 jump 条件输入接口
+
+针对 local_jump，本轮先没有直接重训一个大模型，而是在 `Stage2ICCDModel` 和 `IFRefinementHead` 中加入了条件输入接口：
+
+- `Stage2ModelConfig.refine_extra_channels`
+- `Stage2ICCDModel.forward(..., refinement_extra=...)`
+- `IFRefinementHead.forward(..., extra=...)`
+
+这样后续可以把 Stage1 的 `jump_mask`、`jump_prob` 或 `jump_center` 辅助输出拼到 refinement head 的输入里。默认配置仍然是 `refine_extra_channels=0`，因此旧 checkpoint 不受影响。
+
+这一点目前属于“结构预留”，还不是完整 local_jump 优化。真正让它产生收益，还需要两步：
+
+1. 在 Stage1 输出中稳定导出每个候选 IF 对应的 jump probability 或 jump center；
+2. 训练 Stage2 local_jump 专项模型，让 refinement head 学会在 jump 区域放宽平滑约束，在非 jump 区域保持强正则。
+
+### 15.4 当前验证结果与是否进入下一步
+
+本轮代码级验证均通过：
+
+- `compileall` 通过；
+- `stage2_iccd.smoke_test` 通过，ICCD 的 `alpha`、候选权重和 refinement head 梯度正常；
+- `simple_active_mixed` 短训练通过，并产生 `inactive_component_mse`；
+- supervised quality selector 能训练、保存、加载和独立评估。
+
+但从任务效果看，还不能把 supervised quality selector 设为默认策略。原因很清楚：它虽然避免了完全塌缩，但整体 IF MAE 还没有稳定超过永远使用多项式专项分支。也就是说，P0 里的“监督式质量选择头”已经完成工程闭环，但还没有达到“默认部署”的效果闭环。
+
+下一步更合理的优化顺序是：
+
+1. 先扩大 quality selector 的特征，加入 Stage1 top-2 置信度、active-count 置信度、分支间身份一致性和局部曲率突变特征；
+2. 对 active-component loss 做更长训练，单独评估单分量输入下的 inactive component energy；
+3. 接入 Stage1 的 jump auxiliary 输出，开始训练 `jump_mask` 条件化的 local_jump refinement；
+4. 等 quality selector 能稳定超过 specialist 或至少稳定降低 p95，再把它接入默认 routed Stage2；
+5. 最后再推进相位通道或多专家软融合，因为这两项会牵动 Stage1/Stage2 输入结构，改动范围更大。

@@ -14,6 +14,7 @@ class Stage2ModelConfig:
     num_candidates: int = 2
     refine_channels: int = 32
     refine_layers: int = 3
+    refine_extra_channels: int = 0
     max_refine_hz: float = 35.0
     freq_min: float = 35.0
     freq_max: float = 430.0
@@ -26,6 +27,7 @@ def stage2_model_config_from_dict(data: dict) -> Stage2ModelConfig:
         num_candidates=int(data.get("num_candidates", 2)),
         refine_channels=int(data.get("refine_channels", 32)),
         refine_layers=int(data.get("refine_layers", 3)),
+        refine_extra_channels=int(data.get("refine_extra_channels", 0)),
         max_refine_hz=float(data.get("max_refine_hz", 35.0)),
         freq_min=float(data.get("freq_min", 35.0)),
         freq_max=float(data.get("freq_max", 430.0)),
@@ -84,12 +86,13 @@ class CandidateMixer(nn.Module):
 class IFRefinementHead(nn.Module):
     """Small 1D refinement head for residual IF correction."""
 
-    def __init__(self, num_components: int, channels: int, layers: int, max_refine_hz: float):
+    def __init__(self, num_components: int, channels: int, layers: int, max_refine_hz: float, extra_channels: int = 0):
         super().__init__()
         self.max_refine_hz = float(max_refine_hz)
+        self.extra_channels = max(0, int(extra_channels))
         hidden = max(4, int(channels))
         blocks: list[nn.Module] = [
-            nn.Conv1d(num_components + 1, hidden, kernel_size=7, padding=3),
+            nn.Conv1d(num_components + 1 + self.extra_channels, hidden, kernel_size=7, padding=3),
             nn.SiLU(),
         ]
         for _ in range(max(0, int(layers) - 1)):
@@ -103,10 +106,19 @@ class IFRefinementHead(nn.Module):
         blocks.append(nn.Conv1d(hidden, num_components, kernel_size=3, padding=1))
         self.net = nn.Sequential(*blocks)
 
-    def forward(self, signal: torch.Tensor, if_hz: torch.Tensor) -> torch.Tensor:
+    def forward(self, signal: torch.Tensor, if_hz: torch.Tensor, extra: torch.Tensor | None = None) -> torch.Tensor:
         signal_norm = signal / signal.std(dim=-1, keepdim=True).clamp_min(1.0e-6)
         if_norm = if_hz / if_hz.detach().amax(dim=-1, keepdim=True).clamp_min(1.0)
-        features = torch.cat([if_norm, signal_norm.unsqueeze(1)], dim=1)
+        parts = [if_norm, signal_norm.unsqueeze(1)]
+        if self.extra_channels > 0:
+            if extra is None:
+                extra = signal.new_zeros((signal.shape[0], self.extra_channels, signal.shape[-1]))
+            if extra.shape[0] != signal.shape[0] or extra.shape[-1] != signal.shape[-1]:
+                raise ValueError(f"Expected refinement extra [B,C,N], got {tuple(extra.shape)}")
+            if extra.shape[1] != self.extra_channels:
+                raise ValueError(f"Expected {self.extra_channels} refinement extra channels, got {extra.shape[1]}")
+            parts.append(extra)
+        features = torch.cat(parts, dim=1)
         return self.max_refine_hz * torch.tanh(self.net(features))
 
 
@@ -126,12 +138,18 @@ class Stage2ICCDModel(nn.Module):
             channels=model_cfg.refine_channels,
             layers=model_cfg.refine_layers,
             max_refine_hz=model_cfg.max_refine_hz,
+            extra_channels=model_cfg.refine_extra_channels,
         )
         self.iccd = DifferentiableICCD(iccd_cfg)
 
-    def forward(self, signal: torch.Tensor, candidate_if_hz: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        signal: torch.Tensor,
+        candidate_if_hz: torch.Tensor,
+        refinement_extra: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         initial_if, candidate_weights = self.mixer(candidate_if_hz, signal=signal, iccd=self.iccd)
-        delta_if = self.refine_head(signal, initial_if)
+        delta_if = self.refine_head(signal, initial_if, extra=refinement_extra)
         refined_if = (initial_if + delta_if).clamp(float(self.model_cfg.freq_min), float(self.model_cfg.freq_max))
         iccd_out = self.iccd(signal, refined_if)
         iccd_out.update(

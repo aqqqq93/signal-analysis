@@ -22,12 +22,64 @@ def component_permutation_mse(pred: torch.Tensor, target: torch.Tensor) -> torch
     return _min_perm(cost)
 
 
+def active_component_permutation_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    active_mask: torch.Tensor | None = None,
+    inactive_weight: float = 0.15,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permutation component MSE with inactive-slot energy suppression.
+
+    Active targets are matched one-to-one to predicted slots. Predicted slots
+    assigned to inactive targets are not ignored; their energy is penalized so a
+    one-component signal is not silently split into two reconstructed outputs.
+    """
+
+    if pred.shape[:2] != target.shape[:2]:
+        raise ValueError("Predicted and target components must share [B, Q].")
+    if active_mask is None:
+        return component_permutation_mse(pred, target), pred.new_tensor(0.0)
+    active_mask = active_mask.to(device=pred.device, dtype=pred.dtype)
+    if active_mask.shape != pred.shape[:2]:
+        raise ValueError(f"active_mask shape {tuple(active_mask.shape)} does not match [B,Q]={tuple(pred.shape[:2])}")
+
+    bsz, q, _ = pred.shape
+    comp_cost = torch.empty((bsz, q, q), device=pred.device, dtype=pred.dtype)
+    for pred_idx in range(q):
+        comp_cost[:, pred_idx, :] = (pred[:, pred_idx : pred_idx + 1] - target).pow(2).mean(dim=-1)
+    pred_energy = pred.pow(2).mean(dim=-1)
+    active_loss, inactive_loss = _min_active_perm(
+        comp_cost,
+        pred_energy,
+        active_mask,
+        inactive_match_weight=float(inactive_weight),
+    )
+    return active_loss + float(inactive_weight) * inactive_loss, inactive_loss
+
+
 def component_permutation_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     bsz, q, _ = pred.shape
     cost = torch.empty((bsz, q, q), device=pred.device, dtype=pred.dtype)
     for pred_idx in range(q):
         cost[:, pred_idx, :] = (pred[:, pred_idx : pred_idx + 1] - target).abs().mean(dim=-1)
     return _min_perm(cost)
+
+
+def active_component_permutation_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    active_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if active_mask is None:
+        return component_permutation_l1(pred, target)
+    active_mask = active_mask.to(device=pred.device, dtype=pred.dtype)
+    bsz, q, _ = pred.shape
+    cost = torch.empty((bsz, q, q), device=pred.device, dtype=pred.dtype)
+    for pred_idx in range(q):
+        cost[:, pred_idx, :] = (pred[:, pred_idx : pred_idx + 1] - target).abs().mean(dim=-1)
+    pred_energy = pred.abs().mean(dim=-1)
+    active_loss, inactive_loss = _min_active_perm(cost, pred_energy, active_mask)
+    return active_loss + inactive_loss
 
 
 def if_smoothness(if_hz: torch.Tensor) -> torch.Tensor:
@@ -48,3 +100,31 @@ def _min_perm(cost: torch.Tensor) -> torch.Tensor:
     rows = torch.arange(q, device=cost.device)
     values = [cost[:, rows, torch.tensor(perm, device=cost.device)].sum(dim=1) for perm in perms]
     return torch.stack(values, dim=1).min(dim=1).values.mean() / q
+
+
+def _min_active_perm(
+    cost: torch.Tensor,
+    pred_energy: torch.Tensor,
+    active_mask: torch.Tensor,
+    inactive_match_weight: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bsz, q, _ = cost.shape
+    perms = list(itertools.permutations(range(q)))
+    rows = torch.arange(q, device=cost.device)
+    active_terms = []
+    inactive_terms = []
+    for perm in perms:
+        perm_tensor = torch.tensor(perm, device=cost.device)
+        target_active = active_mask[:, perm_tensor]
+        matched = cost[:, rows, perm_tensor]
+        active_denom = target_active.sum(dim=1).clamp_min(1.0)
+        inactive = 1.0 - target_active
+        inactive_denom = inactive.sum(dim=1).clamp_min(1.0)
+        active_terms.append((matched * target_active).sum(dim=1) / active_denom)
+        inactive_terms.append((pred_energy * inactive).sum(dim=1) / inactive_denom)
+    active_stack = torch.stack(active_terms, dim=1)
+    inactive_stack = torch.stack(inactive_terms, dim=1)
+    total = active_stack + float(inactive_match_weight) * inactive_stack
+    best = total.argmin(dim=1)
+    batch_idx = torch.arange(bsz, device=cost.device)
+    return active_stack[batch_idx, best].mean(), inactive_stack[batch_idx, best].mean()

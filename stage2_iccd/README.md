@@ -32,6 +32,7 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/model.py`: candidate mixer, lightweight IF refinement head, and full stage-2 model.
 - `src/stage2_iccd/candidates.py`: frozen IF-Net candidate provider plus an oracle-perturbed debug provider.
 - `src/stage2_iccd/train_stage2.py`: training loop for the frozen-IF-Net stage.
+- `src/stage2_iccd/quality_selector.py`: supervised branch-quality selector used to compare default and specialist stage-2 branches.
 - `src/stage2_iccd/eval_scenarios.py`: per-scenario reconstruction and IF evaluation.
 - `src/stage2_iccd/active_count.py`: lightweight active-component count classifier.
 - `src/stage2_iccd/train_active_count.py`: active-count router training.
@@ -41,6 +42,8 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `scripts/compare_stage2_checkpoints.py`: sample-wise IF/SNR comparison between two stage-2 checkpoints.
 - `scripts/evaluate_stage2_quality_gate.py`: diagnostic gate between the default and polynomial-specialist stage-2 checkpoints.
 - `scripts/sweep_stage2_quality_gate.py`: offline sweep for quality-gate score penalties and margins.
+- `scripts/train_stage2_quality_selector.py`: supervised quality-selector training; labels are generated from which branch has lower IF MAE on simulated data.
+- `scripts/eval_stage2_quality_selector.py`: independent per-scenario evaluation for the supervised quality selector.
 - `scripts/analyze_reference_style_signals.py`: synthesizes time-domain signals shaped like external STFT examples, then runs the routed stage-2 model on those signals.
 - `scripts/build_stage2_summary_pdf.py`: rebuilds `output/pdf/stage2_iccd_summary.pdf` from `results_summary_zh.md`.
 - `results_summary_zh.md`: current Chinese training summary, per-scenario metrics, and next-step diagnosis.
@@ -132,6 +135,14 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
 .\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\sweep_stage2_quality_gate.py --csv stage2_iccd/runs/poly_multicomponent_refine/quality_gate_easy/quality_gate.csv --output-json stage2_iccd/runs/poly_multicomponent_refine/quality_gate_easy/sweep.json
 ```
 
+Supervised quality-selector training and evaluation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src;."
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\train_stage2_quality_selector.py --run-dir stage2_iccd/runs/stage2_quality_selector_poly_balanced --steps 500 --batch-size 8 --balance-classes --margin-scale-hz 0.8
+.\.venv_ifnet\Scripts\python.exe stage2_iccd\scripts\eval_stage2_quality_selector.py --selector-checkpoint stage2_iccd/runs/stage2_quality_selector_poly_balanced/best.pt --output-dir stage2_iccd/runs/stage2_quality_selector_poly_balanced/eval_best
+```
+
 Reference-style external signal analysis:
 
 ```powershell
@@ -148,3 +159,9 @@ Rebuild the Chinese PDF summary:
 `default.yaml` is intentionally easier than the real setting because it uses perturbed true IF curves. It is for validating the ICCD layer, alpha learning, candidate weighting, and refinement-head gradients before using real IF-Net outputs.
 
 For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yaml` can use either one checkpoint or a `checkpoints:` list. With multiple checkpoints, the candidate mixer learns soft weights across frozen expert IF outputs; with one checkpoint, it falls back to raw-plus-smoothed candidates for debugging.
+
+## Current P0 Optimization Hooks
+
+- Active-component component loss now uses the ground-truth active mask before component matching and adds an inactive-slot energy penalty. This prevents a one-component signal from being silently split across two reconstructed output slots.
+- `Stage2ModelConfig.refine_extra_channels` and `Stage2ICCDModel.forward(..., refinement_extra=...)` reserve a clean interface for later `jump_mask` or `jump_prob` conditioning. The default remains zero extra channels, so existing checkpoints keep loading normally.
+- The supervised quality selector is implemented as a lightweight MLP over deployment-safe branch features: reconstruction residuals, branch residual ratios, IF difference statistics, smoothness, range, curvature, and candidate entropy. It is currently a diagnostic branch chooser, not yet the default production route.

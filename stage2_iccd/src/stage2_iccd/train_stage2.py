@@ -18,6 +18,8 @@ from .candidates import FrozenIFNetCandidateProvider, OraclePerturbedCandidatePr
 from .differentiable_iccd import iccd_config_from_dict
 from .losses import (
     candidate_entropy,
+    active_component_permutation_mse,
+    active_component_permutation_l1,
     component_permutation_mse,
     component_permutation_l1,
     if_smoothness,
@@ -177,8 +179,18 @@ def compute_loss(
     comps = out["components"]
     refined_if = out["refined_if_hz"]
     loss_rec = torch.mean((rec - clean).pow(2))
-    loss_comp = component_permutation_mse(comps, target_components)
-    loss_comp_l1 = component_permutation_l1(comps, target_components)
+    if active_mask is not None:
+        loss_comp, loss_inactive = active_component_permutation_mse(
+            comps,
+            target_components,
+            active_mask=active_mask,
+            inactive_weight=float(weights.get("inactive_component", 0.15)),
+        )
+        loss_comp_l1 = active_component_permutation_l1(comps, target_components, active_mask=active_mask)
+    else:
+        loss_comp = component_permutation_mse(comps, target_components)
+        loss_inactive = comps.new_tensor(0.0)
+        loss_comp_l1 = component_permutation_l1(comps, target_components)
     loss_if = masked_permutation_l1(refined_if, target_if, active_mask)
     loss_smooth = if_smoothness(refined_if)
     loss_entropy = candidate_entropy(out["candidate_weights"])
@@ -194,6 +206,7 @@ def compute_loss(
     metrics = {
         "rec_mse": float(loss_rec.detach().cpu()),
         "component_mse": float(loss_comp.detach().cpu()),
+        "inactive_component_mse": float(loss_inactive.detach().cpu()),
         "component_l1": float(loss_comp_l1.detach().cpu()),
         "if_mae_hz": float(loss_if.detach().cpu()),
         "smooth": float(loss_smooth.detach().cpu()),
