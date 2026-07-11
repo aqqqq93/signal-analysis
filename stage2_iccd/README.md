@@ -42,6 +42,9 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/pipeline.py`: P1.5 stable inference wrapper over the current best single/multi/local-jump/all-expert branches.
 - `src/stage2_iccd/eval_p15_pipeline.py`: P1.5 all-scenario routed evaluation and visualization.
 - `src/stage2_iccd/infer_p15_signal.py`: `.npy` time-domain signal inference entrypoint for the P1.5 pipeline.
+- `src/stage2_iccd/domain_adaptation.py`: P2 STFT-domain gap diagnostic for folders of real or external `.npy` signals.
+- `src/stage2_iccd/train_tiny_distill.py`: P2 Tiny-IF-Net distillation from the routed Stage2 teacher.
+- `src/stage2_iccd/p2_report.py`: P2 HTML report builder for routed metrics and generated plots.
 - `scripts/plot_old_new_stage2_comparison.py`: visual comparison between an older checkpoint and the current routed stage-2 output.
 - `scripts/compare_stage2_checkpoints.py`: sample-wise IF/SNR comparison between two stage-2 checkpoints.
 - `scripts/evaluate_stage2_quality_gate.py`: diagnostic gate between the default and polynomial-specialist stage-2 checkpoints.
@@ -69,6 +72,8 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `configs/simple_multicomponent_unfreeze_p1.yaml`: P1 decoder+head unfreeze probe; diagnostic only because it regressed against the frozen baseline.
 - `configs/simple_multicomponent_unfreeze_head_p1.yaml`: safer head-only unfreeze probe; diagnostic only, not the default checkpoint.
 - `configs/active_count_123_peak_p1.yaml`: P1 active-count router extended to 1/2/3 components with peak-count auxiliary features.
+- `configs/crossing_identity_p2.yaml`: P2 crossing-specialist fine-tuning with identity-continuity and physical IF regularizers.
+- `configs/three_component_oracle_p2.yaml`: P2 three-component differentiable ICCD validation with oracle-perturbed IF candidates.
 - `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
 - `configs/default.yaml`: quick debug training with perturbed ground-truth IF candidates.
 - `configs/frozen_ifnet.yaml`: real stage-2 training initialized by a frozen stage-1 checkpoint.
@@ -216,6 +221,37 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.infer_p15_signal --input-npy tmp\p15_test_signal.npy --output-dir stage2_iccd/runs/p15_pipeline/infer_smoke --fs 1024
 ```
 
+P2 crossing-specialist training and routed evaluation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/crossing_identity_p2.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir stage2_iccd/runs/p2_pipeline/eval_default --batches 6 --batch-size 4 --plots-per-case 1 --crossing-checkpoint stage2_iccd/runs/crossing_identity_p2/latest.pt --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+P2 three-component ICCD validation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/three_component_oracle_p2.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/three_component_oracle_p2/latest.pt --output-dir stage2_iccd/runs/three_component_oracle_p2/eval_p2 --scenarios linear quadratic cubic near_parallel crossing --batches 12 --batch-size 5 --snr-db-min 0 --snr-db-max 24
+```
+
+P2 domain-gap diagnostic and HTML report:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.domain_adaptation --npy-dir tmp --output-json stage2_iccd/runs/p2_domain/domain_summary.json --max-files 8
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.p2_report --eval-dir stage2_iccd/runs/p2_pipeline/eval_default --output-html stage2_iccd/runs/p2_pipeline/eval_default/p2_report.html --title "Stage2 P2 pipeline report"
+```
+
+P2 Tiny-IF-Net distillation:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_tiny_distill --run-dir stage2_iccd/runs/tiny_ifnet_distill_p2 --steps 80 --batch-size 6
+```
+
 Reference-style external signal analysis:
 
 ```powershell
@@ -256,3 +292,11 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 - For real `.npy` signals without scenario labels, the pipeline falls back to active-count routing and returns the predicted active count, branch name, active confidence, candidate top-2 weights, full IF slots, and active IF slots.
 - `identity_stable_if_hz` is exported as a visualization-friendly postprocessed IF track. It keeps curve identity continuous for display, while reconstruction still comes from the model's original refined IF.
 - P1.5 is the recommended bridge before P2: it gives a reproducible baseline and exposes the remaining P2 blockers, especially crossing identity/reconstruction and diffuse top-2 candidate weights in all-expert hard cases.
+
+## Current P2 Hooks
+
+- `compute_loss` supports optional physical IF regularizers: third-derivative smoothness, crossing identity continuity, minimum-gap barrier, and sinusoidal curvature consistency. These are disabled unless their loss weights are set in a config.
+- `P15Stage2Pipeline` can accept an optional `crossing_checkpoint`; when provided, crossing samples route to the P2 crossing specialist instead of the generic all-expert branch.
+- `three_component_oracle_p2.yaml` validates that differentiable ICCD, active masks, and component matching work for three output components. It is not yet a real three-component IF-Net deployment path.
+- `domain_adaptation.py` measures STFT feature gaps for external `.npy` signals before Stage2-only fine-tuning. It does not update Stage1.
+- `train_tiny_distill.py` provides the distillation path from the routed Stage2 teacher to a lightweight student. The current short run is diagnostic; it is not a default inference replacement.

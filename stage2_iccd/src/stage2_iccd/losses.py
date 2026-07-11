@@ -89,6 +89,56 @@ def if_smoothness(if_hz: torch.Tensor) -> torch.Tensor:
     return second.pow(2).mean()
 
 
+def if_third_derivative(if_hz: torch.Tensor) -> torch.Tensor:
+    if if_hz.shape[-1] < 4:
+        return if_hz.new_tensor(0.0)
+    third = if_hz[..., 3:] - 3.0 * if_hz[..., 2:-1] + 3.0 * if_hz[..., 1:-2] - if_hz[..., :-3]
+    return third.pow(2).mean()
+
+
+def crossing_identity_loss(if_hz: torch.Tensor, gap_sigma_hz: float = 24.0) -> torch.Tensor:
+    """Local identity-continuity penalty near two-ridge crossings.
+
+    It does not force a fixed frequency order. Instead, it focuses on the
+    short time span where component gaps are small and discourages abrupt
+    velocity reversals on each output slot.
+    """
+
+    if if_hz.ndim != 3 or if_hz.shape[1] < 2 or if_hz.shape[-1] < 4:
+        return if_hz.new_tensor(0.0)
+    first = if_hz[:, :, 1:] - if_hz[:, :, :-1]
+    previous = first[:, :, :-1]
+    current = first[:, :, 1:]
+    product = previous * current
+    gap = (if_hz[:, 0] - if_hz[:, 1]).abs()
+    near = torch.exp(-0.5 * (gap[:, 1:-1] / max(float(gap_sigma_hz), 1.0e-6)).pow(2))
+    reversal = torch.relu(-product).sum(dim=1)
+    accel = (current - previous).pow(2).sum(dim=1)
+    return ((reversal + 0.15 * accel) * near).sum() / near.sum().clamp_min(1.0)
+
+
+def min_gap_barrier(if_hz: torch.Tensor, min_gap_hz: float = 8.0) -> torch.Tensor:
+    if if_hz.ndim != 3 or if_hz.shape[1] < 2:
+        return if_hz.new_tensor(0.0)
+    penalties = []
+    for left in range(if_hz.shape[1]):
+        for right in range(left + 1, if_hz.shape[1]):
+            gap = (if_hz[:, left] - if_hz[:, right]).abs()
+            penalties.append(torch.relu(float(min_gap_hz) - gap).pow(2).mean())
+    return torch.stack(penalties).mean() if penalties else if_hz.new_tensor(0.0)
+
+
+def sinusoidal_curvature_consistency(if_hz: torch.Tensor) -> torch.Tensor:
+    """Weak periodic-FM prior: curvature energy should not be bursty."""
+
+    if if_hz.shape[-1] < 5:
+        return if_hz.new_tensor(0.0)
+    second = if_hz[..., 2:] - 2.0 * if_hz[..., 1:-1] + if_hz[..., :-2]
+    energy = second.pow(2)
+    centered = energy - energy.mean(dim=-1, keepdim=True)
+    return centered.pow(2).mean()
+
+
 def candidate_entropy(weights: torch.Tensor) -> torch.Tensor:
     probs = weights.clamp_min(1.0e-8)
     return -(probs * probs.log()).sum()

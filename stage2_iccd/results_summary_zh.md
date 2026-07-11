@@ -1307,3 +1307,198 @@ P1.5 可以认为已经完成以下闭环：
 2. crossing 仍然没有真正解决。P1.5 通过 all-expert 分支降低了部分误差，但双分量 crossing 的重构和身份一致性仍然偏弱。
 
 因此，下一步可以进入 P2，但 P2 的第一件事不应是全面扩展真实数据或模型蒸馏，而应先围绕 crossing 做结构性修复：加入身份一致性损失、轨迹连续匹配、crossing 专项候选融合，或者在可微 ICCD 展开层中加入交叉点附近的局部重构约束。完成这个补强后，再推进 P2 的真实数据域适应和三分量扩展会更稳。
+
+## 20. 2026-07-11 补充：P2 工程闭环
+
+P2 的目标不是只继续调参，而是把“可微 ICCD + IF-Net”的第二阶段从单一实验扩展成可以支撑后续真实信号、三分量、物理正则和推理加速的工程体系。本轮 P2 按照 P1.5 暴露的问题推进：先补 crossing，再补三分量验证、真实信号域差诊断、Tiny 模型蒸馏和统一 HTML 报告。
+
+### 20.1 P2 物理正则与 crossing 身份约束
+
+新增代码位置：
+
+- `stage2_iccd/src/stage2_iccd/losses.py`
+  - `if_third_derivative(...)`：约束 IF 的三阶变化，用于多项式/平滑轨迹；
+  - `crossing_identity_loss(...)`：在两条 IF 接近时，不固定频率上下顺序，而是约束每个输出槽的速度连续性，避免 crossing 附近突然换身份；
+  - `min_gap_barrier(...)`：弱约束过近分量，主要用于三分量或非 crossing 场景；
+  - `sinusoidal_curvature_consistency(...)`：给正弦调频类轨迹一个“曲率能量不过度局部爆发”的弱先验。
+
+- `stage2_iccd/src/stage2_iccd/train_stage2.py`
+  - `compute_loss(...)` 已接入上述正则；
+  - 默认权重为 0，不影响 P1/P1.5 旧配置；
+  - 只有在 config 的 `train.loss` 中显式设置 `third_derivative`、`crossing_identity` 等权重时才启用。
+
+新增 crossing 专项配置：
+
+- `stage2_iccd/configs/crossing_identity_p2.yaml`
+- checkpoint：`stage2_iccd/runs/crossing_identity_p2/latest.pt`
+
+该配置从 `all_multiexpert_ohem_p1` 继续训练，只采样 crossing 场景，并加入：
+
+- `third_derivative: 0.00025`
+- `crossing_identity: 0.003`
+- `crossing_gap_sigma_hz: 30.0`
+
+独立 crossing 评估结果：
+
+| 模型 | crossing IF MAE / Hz | crossing SNR / dB | top-2 覆盖 |
+| --- | ---: | ---: | ---: |
+| P1.5 all-expert crossing 路由 | 27.749 | 4.608 | 78.44% |
+| P2 crossing_identity_p2 路由 | 23.941 | 4.821 | 81.55% |
+
+结论：P2 crossing 专项分支有效，IF MAE 下降约 `13.7%`，top-2 候选覆盖也有提升。但 crossing 仍未彻底解决，尤其是身份稳定后处理 `post_identity_if_mae_hz` 反而可能变差，说明后处理不能替代训练期的身份建模。
+
+### 20.2 P2 全场景 pipeline 结果
+
+P2 pipeline 在 P1.5 基础上显式接入 crossing 专项分支：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir stage2_iccd/runs/p2_pipeline/eval_default --batches 6 --batch-size 4 --plots-per-case 1 --crossing-checkpoint stage2_iccd/runs/crossing_identity_p2/latest.pt --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+总体结果：
+
+| 指标 | P1.5 | P2 |
+| --- | ---: | ---: |
+| aggregate IF MAE | 5.162 Hz | 4.506 Hz |
+| aggregate reconstruction SNR | 20.578 dB | 20.775 dB |
+| active route accuracy | 96.09% | 96.35% |
+| top-2 candidate coverage | 86.98% | 87.15% |
+| crossing active=2 IF MAE | 25.996 Hz | 21.349 Hz |
+
+分支比例：
+
+| 分支 | 比例 |
+| --- | ---: |
+| single | 25.52% |
+| multi | 24.22% |
+| local_jump | 12.50% |
+| crossing | 12.50% |
+| all_expert | 25.26% |
+
+结论：P2 相比 P1.5 有明确收益，尤其是 crossing 双分量从 `25.996 Hz` 降到 `21.349 Hz`。但 top-2 覆盖率仍只有 `87.15%`，没有稳定超过 88%，说明多专家候选融合仍是后续可以继续提高的点。
+
+### 20.3 三分量 Stage2 / ICCD 验证
+
+新增配置：
+
+- `stage2_iccd/configs/three_component_oracle_p2.yaml`
+- checkpoint：`stage2_iccd/runs/three_component_oracle_p2/latest.pt`
+
+该配置使用 `num_components: 3` 和 `oracle_perturbed` 候选 IF。这里的目标不是宣称真实三分量 IF-Net 已经完成，而是验证 Stage2 的可微 ICCD、active mask、component matching 和三分量 loss 能否稳定工作。
+
+独立评估结果：
+
+| 指标 | 数值 |
+| --- | ---: |
+| aggregate IF MAE | 6.458 Hz |
+| aggregate SNR | 15.442 dB |
+| linear IF MAE | 6.524 Hz |
+| quadratic IF MAE | 6.553 Hz |
+| cubic IF MAE | 6.380 Hz |
+| near_parallel IF MAE | 6.267 Hz |
+| crossing IF MAE | 6.565 Hz |
+
+结论：三分量 ICCD 展开层和损失函数已经跑通。下一步若要真正支持三分量真实推理，还需要训练三分量 IF-Net 或三分量候选生成器，而不是继续依赖 oracle 候选。
+
+### 20.4 真实/外部信号域差诊断
+
+新增代码：
+
+- `stage2_iccd/src/stage2_iccd/domain_adaptation.py`
+
+功能：
+
+1. 读取一个目录下的 `.npy` 一维时域信号；
+2. 计算多尺度 STFT 特征统计；
+3. 与仿真训练分布的 STFT 特征做差；
+4. 输出 `feature_l1`、`feature_l2` 和均值统计。
+
+测试命令：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.domain_adaptation --npy-dir tmp --output-json stage2_iccd/runs/p2_domain/domain_summary.json --max-files 8
+```
+
+测试输出：
+
+| 指标 | 数值 |
+| --- | ---: |
+| num_files | 1 |
+| feature_l2 | 0.524 |
+| feature_l1 | 0.104 |
+
+结论：真实/外部信号进入 P2 前，现在已经有一个量化“和仿真训练分布差多远”的入口。它不更新 Stage1，也不直接微调模型；用途是在做 Stage2-only 域适应前先判断输入信号是否明显偏离当前仿真域。
+
+### 20.5 Tiny-IF-Net 蒸馏
+
+新增代码：
+
+- `stage2_iccd/src/stage2_iccd/train_tiny_distill.py`
+
+训练方式：
+
+- teacher：P1.5/P2 routed Stage2 pipeline；
+- student：轻量 `TinyIFNet`；
+- 输入：多尺度 STFT 特征；
+- 监督：teacher 输出的 `identity_stable_if_hz`；
+- 目的：把多分支 Stage2 推理蒸馏为一个更快的 IF 估计器。
+
+测试命令：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_tiny_distill --run-dir stage2_iccd/runs/tiny_ifnet_distill_p2 --steps 80 --batch-size 6
+```
+
+短训练结果：
+
+| step | teacher-student IF MAE |
+| ---: | ---: |
+| 10 | 90.204 Hz |
+| 30 | 32.301 Hz |
+| 50 | 26.296 Hz |
+| 80 | 28.471 Hz |
+
+结论：蒸馏入口已经跑通，学生模型能快速下降，但 80 步结果仍明显不够好，不能作为默认推理替代。后续若要做部署加速，需要更长训练、更强 student、场景均衡采样，以及同时监督 active-count 和 IF。
+
+### 20.6 HTML 报告
+
+新增代码：
+
+- `stage2_iccd/src/stage2_iccd/p2_report.py`
+
+功能：
+
+- 读取 `eval_p15_pipeline.py`、`eval_scenarios.py` 或 routed eval 的 metrics JSON；
+- 自动生成 HTML 表格；
+- 自动嵌入 overview 和各场景图片；
+- 自动提示 top-2 覆盖不足、crossing 风险等问题。
+
+已生成报告：
+
+- `stage2_iccd/runs/p2_pipeline/eval_default/p2_report.html`
+- `stage2_iccd/runs/p2_pipeline/eval_crossing_routed/p2_report.html`
+
+### 20.7 P2 完成判断
+
+到目前为止，P2 可以认为完成了工程闭环：
+
+- crossing 专项分支完成并接入统一 pipeline；
+- 物理 IF 正则完整接入训练 loss；
+- 三分量 Stage2/ICCD 路径跑通；
+- `.npy` 真实/外部信号域差诊断入口跑通；
+- Tiny-IF-Net 蒸馏入口跑通；
+- HTML 报告入口跑通；
+- README 和 PDF 总结已同步。
+
+但 P2 的实验结论必须保持克制：
+
+1. crossing 有改善，但仍是最大误差来源；
+2. top-2 candidate coverage 从 `86.98%` 提升到 `87.15%`，仍未稳定超过 `88%`；
+3. 三分量目前是 oracle 候选验证，不是真实三分量 IF-Net 推理；
+4. Tiny 蒸馏只是接口完成，还不能替代多分支 Stage2；
+5. 域适应目前是诊断入口，不是已经完成真实数据微调。
+
+因此，当前可以进入下一阶段的真实信号实验，但推荐路线是：先用 P2 pipeline 处理真实 `.npy` 信号并生成 HTML 报告，再根据 domain gap 决定是否只微调 Stage2；不要直接解冻 Stage1，也不要马上把 Tiny 模型作为主推理模型。

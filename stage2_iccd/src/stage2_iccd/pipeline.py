@@ -35,6 +35,7 @@ class P15PipelineConfig:
     multi_checkpoint: str = "stage2_iccd/runs/simple_multicomponent_long/latest.pt"
     local_jump_checkpoint: str = "stage2_iccd/runs/local_jump_segmented_p1/latest.pt"
     all_expert_checkpoint: str = "stage2_iccd/runs/all_multiexpert_ohem_p1/latest.pt"
+    crossing_checkpoint: str | None = None
     low_confidence_all_expert_threshold: float = 0.58
     near_parallel_second_peak_rate: float = 0.18
     near_parallel_second_peak_ratio: float = 0.32
@@ -106,6 +107,8 @@ class P15Stage2Pipeline:
             "local_jump": Stage2Branch("local_jump", self.cfg.local_jump_checkpoint, self.device),
             "all_expert": Stage2Branch("all_expert", self.cfg.all_expert_checkpoint, self.device),
         }
+        if self.cfg.crossing_checkpoint:
+            self.branches["crossing"] = Stage2Branch("crossing", self.cfg.crossing_checkpoint, self.device)
 
     @torch.no_grad()
     def run(
@@ -161,6 +164,8 @@ class P15Stage2Pipeline:
             )
             if self.cfg.use_scenario_hints and hint == "local_jump":
                 branch = "local_jump"
+            elif self.cfg.use_scenario_hints and hint == "crossing" and "crossing" in self.branches:
+                branch = "crossing"
             elif self.cfg.use_scenario_hints and hint in DIFFICULT_SCENARIOS:
                 branch = "all_expert"
             elif self.cfg.use_scenario_hints and near_parallel_has_two_ridges:

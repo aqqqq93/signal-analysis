@@ -20,7 +20,7 @@ from ifnet_stage1.simulation import SCENARIOS, ChirpSimulator, sim_config_from_d
 from .active_count import active_count_labels
 from .eval_scenarios import parse_noise_types
 from .pipeline import P15PipelineConfig, P15Stage2Pipeline
-from .train_stage2 import compute_loss
+from .train_stage2 import compute_loss, masked_permutation_l1
 
 
 DEFAULT_BRANCH_SCENARIOS = ("linear", "quadratic", "cubic", "sinusoidal_fm", "crossing", "near_parallel", "local_jump", "tangent_or_overlap")
@@ -37,9 +37,10 @@ def evaluate_p15_pipeline(
     use_scenario_hints: bool = True,
     data_overrides: dict[str, Any] | None = None,
     plots_per_case: int = 0,
+    crossing_checkpoint: str | None = None,
 ) -> dict[str, Any]:
     device = choose_device(device_name)
-    cfg = P15PipelineConfig(use_scenario_hints=use_scenario_hints)
+    cfg = P15PipelineConfig(use_scenario_hints=use_scenario_hints, crossing_checkpoint=crossing_checkpoint)
     pipeline = P15Stage2Pipeline(cfg, device=device)
     selected_scenarios = scenarios or list(DEFAULT_BRANCH_SCENARIOS)
     selected_active = active_components or [1, 2]
@@ -86,6 +87,16 @@ def evaluate_p15_pipeline(
                     {},
                     active_mask=batch.get("active_mask"),
                 )
+                if "identity_stable_if_hz" in out:
+                    metrics["post_identity_if_mae_hz"] = float(
+                        masked_permutation_l1(
+                            out["identity_stable_if_hz"],
+                            batch["if_hz"],
+                            batch.get("active_mask"),
+                        )
+                        .detach()
+                        .cpu()
+                    )
                 metric_rows.append(metrics)
                 labels = active_count_labels(batch["active_mask"], num_classes=len(pipeline.active_names)) + 1
                 route_correct.append((route["active_pred"] == labels).float().mean().detach())
@@ -115,6 +126,7 @@ def evaluate_p15_pipeline(
                     "single_rate": branch_counts.get("single", 0) / total_routes,
                     "multi_rate": branch_counts.get("multi", 0) / total_routes,
                     "local_jump_rate": branch_counts.get("local_jump", 0) / total_routes,
+                    "crossing_rate": branch_counts.get("crossing", 0) / total_routes,
                     "all_expert_rate": branch_counts.get("all_expert", 0) / total_routes,
                 }
             )
@@ -136,6 +148,7 @@ def evaluate_p15_pipeline(
             "multi_checkpoint": cfg.multi_checkpoint,
             "local_jump_checkpoint": cfg.local_jump_checkpoint,
             "all_expert_checkpoint": cfg.all_expert_checkpoint,
+            "crossing_checkpoint": cfg.crossing_checkpoint,
             "use_scenario_hints": use_scenario_hints,
         },
         "batches": batches,
@@ -232,6 +245,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--no-scenario-hints", action="store_true")
     parser.add_argument("--plots-per-case", type=int, default=0)
+    parser.add_argument("--crossing-checkpoint", default=None)
     parser.add_argument("--snr-db-min", type=float, default=None)
     parser.add_argument("--snr-db-max", type=float, default=None)
     parser.add_argument("--noise-types-json", default=None)
@@ -255,6 +269,7 @@ def main() -> None:
         use_scenario_hints=not args.no_scenario_hints,
         data_overrides=data_overrides,
         plots_per_case=args.plots_per_case,
+        crossing_checkpoint=args.crossing_checkpoint,
     )
     print(json.dumps(result, indent=2))
 

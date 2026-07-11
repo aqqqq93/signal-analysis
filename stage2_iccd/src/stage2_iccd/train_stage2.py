@@ -22,8 +22,12 @@ from .losses import (
     active_component_permutation_l1,
     component_permutation_mse,
     component_permutation_l1,
+    crossing_identity_loss,
     if_smoothness,
+    if_third_derivative,
+    min_gap_barrier,
     reconstruction_snr_db,
+    sinusoidal_curvature_consistency,
 )
 from .model import Stage2ICCDModel, stage2_model_config_from_dict
 
@@ -265,6 +269,13 @@ def compute_loss(
         loss_comp_l1 = component_permutation_l1(comps, target_components)
     loss_if = masked_permutation_l1(refined_if, target_if, active_mask)
     loss_smooth = if_smoothness(refined_if)
+    loss_third = if_third_derivative(refined_if)
+    loss_crossing_identity = crossing_identity_loss(
+        refined_if,
+        gap_sigma_hz=float(weights.get("crossing_gap_sigma_hz", 24.0)),
+    )
+    loss_min_gap = min_gap_barrier(refined_if, min_gap_hz=float(weights.get("min_gap_hz", 8.0)))
+    loss_sinusoidal = sinusoidal_curvature_consistency(refined_if)
     loss_entropy = candidate_entropy(out["candidate_weights"])
     loss_delta = out["delta_if_hz"].pow(2).mean()
     loss = (
@@ -272,6 +283,10 @@ def compute_loss(
         + float(weights.get("component", 0.25)) * loss_comp
         + float(weights.get("if_l1", 0.05)) * (loss_if / float(fs))
         + float(weights.get("smooth", 0.001)) * (loss_smooth / (float(fs) ** 2))
+        + float(weights.get("third_derivative", 0.0)) * (loss_third / (float(fs) ** 2))
+        + float(weights.get("crossing_identity", 0.0)) * (loss_crossing_identity / (float(fs) ** 2))
+        + float(weights.get("min_gap", 0.0)) * (loss_min_gap / (float(fs) ** 2))
+        + float(weights.get("sinusoidal_curvature", 0.0)) * (loss_sinusoidal / (float(fs) ** 2))
         + float(weights.get("delta", 0.0005)) * (loss_delta / (float(fs) ** 2))
         - float(weights.get("candidate_entropy", 0.0)) * loss_entropy
     )
@@ -282,6 +297,10 @@ def compute_loss(
         "component_l1": float(loss_comp_l1.detach().cpu()),
         "if_mae_hz": float(loss_if.detach().cpu()),
         "smooth": float(loss_smooth.detach().cpu()),
+        "third_derivative": float(loss_third.detach().cpu()),
+        "crossing_identity": float(loss_crossing_identity.detach().cpu()),
+        "min_gap": float(loss_min_gap.detach().cpu()),
+        "sinusoidal_curvature": float(loss_sinusoidal.detach().cpu()),
         "delta_rms_hz": float(torch.sqrt(loss_delta.detach()).cpu()),
         "rec_snr_db": float(reconstruction_snr_db(clean, rec).mean().detach().cpu()),
         "active_components": float(active_mask.sum(dim=1).mean().detach().cpu()) if active_mask is not None else float(target_if.shape[1]),
