@@ -39,6 +39,9 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/train_active_count.py`: active-count router training.
 - `src/stage2_iccd/eval_active_count.py`: active-count router evaluation.
 - `src/stage2_iccd/eval_active_routed_stage2.py`: routed stage-2 evaluation using the active-count router.
+- `src/stage2_iccd/pipeline.py`: P1.5 stable inference wrapper over the current best single/multi/local-jump/all-expert branches.
+- `src/stage2_iccd/eval_p15_pipeline.py`: P1.5 all-scenario routed evaluation and visualization.
+- `src/stage2_iccd/infer_p15_signal.py`: `.npy` time-domain signal inference entrypoint for the P1.5 pipeline.
 - `scripts/plot_old_new_stage2_comparison.py`: visual comparison between an older checkpoint and the current routed stage-2 output.
 - `scripts/compare_stage2_checkpoints.py`: sample-wise IF/SNR comparison between two stage-2 checkpoints.
 - `scripts/evaluate_stage2_quality_gate.py`: diagnostic gate between the default and polynomial-specialist stage-2 checkpoints.
@@ -199,6 +202,20 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_active_count --checkpoint stage2_iccd/runs/active_count_123_peak_p1/latest.pt --output-dir stage2_iccd/runs/active_count_123_peak_p1/eval_p1_compare --scenarios linear quadratic cubic sinusoidal_fm near_parallel --active-components 1 2 3
 ```
 
+P1.5 stable routed pipeline:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir stage2_iccd/runs/p15_pipeline/eval_default --batches 8 --batch-size 4 --plots-per-case 1 --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+P1.5 `.npy` signal inference:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.infer_p15_signal --input-npy tmp\p15_test_signal.npy --output-dir stage2_iccd/runs/p15_pipeline/infer_smoke --fs 1024
+```
+
 Reference-style external signal analysis:
 
 ```powershell
@@ -231,3 +248,11 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 - `FrozenIFNetCandidateProvider` can optionally unfreeze the IF-Net head or the last decoder blocks. This provides the P1 hierarchical-unfreeze path while keeping the default stage-1 provider frozen.
 - `ActiveCountClassifier` now supports dynamic class counts. The P1 1/2/3-component router adds peak-count features to the existing ridge-shape auxiliary features.
 - `train_stage2` supports lightweight scenario-level OHEM by boosting scenarios whose validation IF MAE is in the current high-error tail.
+
+## Current P1.5 Stable Pipeline
+
+- `P15Stage2Pipeline` loads the current recommended branches: `simple_single_component`, `simple_multicomponent_long`, `local_jump_segmented_p1`, and `all_multiexpert_ohem_p1`.
+- For simulated evaluation with scenario hints, `local_jump` samples route to the segmented jump specialist, `crossing`/`sinusoidal_fm`/`tangent_or_overlap` route to the all-expert OHEM branch, and simple/near-parallel samples route through the active-count single/multi decision.
+- For real `.npy` signals without scenario labels, the pipeline falls back to active-count routing and returns the predicted active count, branch name, active confidence, candidate top-2 weights, full IF slots, and active IF slots.
+- `identity_stable_if_hz` is exported as a visualization-friendly postprocessed IF track. It keeps curve identity continuous for display, while reconstruction still comes from the model's original refined IF.
+- P1.5 is the recommended bridge before P2: it gives a reproducible baseline and exposes the remaining P2 blockers, especially crossing identity/reconstruction and diffuse top-2 candidate weights in all-expert hard cases.

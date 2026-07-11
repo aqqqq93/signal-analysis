@@ -1181,3 +1181,129 @@ P1 中也实现了“先固定 IF-Net，重构稳定后再小学习率解冻 IF-
 
 1. 把 `all_multiexpert_ohem_p1`、`local_jump_segmented_p1` 和现有 active-count router 封装到统一推理 pipeline，明确每类样本走哪个分支；
 2. 针对 crossing 单独增加身份一致性约束或轨迹匹配后处理，因为当前 P1 虽降低了 crossing 误差，但 crossing 仍然是全类型中最明显的短板。
+
+## 19. 2026-07-11 补充：P1.5 稳定推理管线收口
+
+P1 完成后，模型已经有多个有效分支，但还缺少一个稳定的“总入口”。如果每次评估都手动选择 checkpoint，后续进入 P2 时很容易出现两个问题：第一，不同实验使用的分支不一致，指标不可复现；第二，真实信号没有场景标签时，不知道应该调用单分量、双分量、local_jump 专项还是全专家分支。
+
+因此 P1.5 的目标不是继续训练一个更大的网络，而是把 P1 中已经筛选出的有效模块封装为统一 pipeline，并把分支选择、置信度、top-2 候选和可视化输出固定下来。
+
+### 19.1 P1.5 管线结构
+
+新增代码如下：
+
+- `stage2_iccd/src/stage2_iccd/pipeline.py`
+  - `P15Stage2Pipeline`：统一加载 active-count router、single 分支、multi 分支、local_jump 分支和 all-expert 分支；
+  - `Stage2Branch`：统一封装 Stage2 checkpoint 的加载、候选 IF 生成、refinement extra 构造和可微 ICCD 推理；
+  - 输出 `branch`、`active_pred`、`active_confidence`、`active_probs`、`candidate_top2_weights`、`candidate_top2_indices`；
+  - 额外输出 `identity_stable_if_hz`，用于 crossing 等场景的可视化连续轨迹展示。
+
+- `stage2_iccd/src/stage2_iccd/eval_p15_pipeline.py`
+  - 用仿真信号批量评估 P1.5 pipeline；
+  - 输出每个场景的 IF MAE、重构 SNR、active 路由准确率、分支选择比例和 top-2 候选权重覆盖；
+  - 可选生成每个场景的 STFT + IF 叠加图。
+
+- `stage2_iccd/src/stage2_iccd/infer_p15_signal.py`
+  - 支持输入 `.npy` 一维时域信号；
+  - 不需要真实 IF 标签；
+  - 自动输出预测 IF、活跃 IF、分支名、active 置信度、候选 top-2 权重和推理图片。
+
+当前 P1.5 默认加载的分支为：
+
+| 功能 | checkpoint |
+| --- | --- |
+| active-count router | `stage2_iccd/runs/active_count_simple_near_parallel/latest.pt` |
+| 单分量分支 | `stage2_iccd/runs/simple_single_component/latest.pt` |
+| 简单双分量/near_parallel 分支 | `stage2_iccd/runs/simple_multicomponent_long/latest.pt` |
+| local_jump 专项分支 | `stage2_iccd/runs/local_jump_segmented_p1/latest.pt` |
+| 全类型困难场景分支 | `stage2_iccd/runs/all_multiexpert_ohem_p1/latest.pt` |
+
+### 19.2 分支选择策略
+
+在仿真评估中，如果有场景标签，P1.5 使用场景 hint 进行更稳定的策略选择：
+
+- `local_jump`：直接走 `local_jump_segmented_p1`；
+- `crossing`、`sinusoidal_fm`、`tangent_or_overlap`：走 `all_multiexpert_ohem_p1`；
+- `linear`、`quadratic`、`cubic`、`near_parallel`：先由 active-count 判断单/双分量，再分别走 single 或 multi 分支。
+
+对真实 `.npy` 信号，如果没有场景标签，则不使用 hint，pipeline 会退化为 active-count 路由：
+
+- 判断为 1 个活跃分量：走 single；
+- 判断为 2 个活跃分量：走 multi；
+- 如果多分量置信度很低，可以进入 all-expert 作为保守备选。
+
+这里曾尝试用 STFT 第二峰特征强行修正 near_parallel 的 active_2 误分，但评估发现该特征不能可靠区分“真实单分量宽脊线”和“双分量近并行脊线”。因此 P1.5 最终采用保守策略：不让二峰启发式覆盖高置信单分量判断，避免为了修 active_2 而重新引入单分量泄漏。
+
+### 19.3 P1.5 全场景评估结果
+
+运行命令如下：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir stage2_iccd/runs/p15_pipeline/eval_default --batches 8 --batch-size 4 --plots-per-case 1 --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+总体结果：
+
+| 指标 | 数值 |
+| --- | ---: |
+| aggregate IF MAE | 5.162 Hz |
+| aggregate reconstruction SNR | 20.578 dB |
+| active route accuracy | 96.09% |
+| active route confidence | 96.84% |
+| top-2 candidate weight coverage | 86.98% |
+| single branch rate | 25.78% |
+| multi branch rate | 24.02% |
+| local_jump branch rate | 12.50% |
+| all_expert branch rate | 37.70% |
+
+分场景 IF MAE 摘要：
+
+| 场景 | active=1 IF MAE / Hz | active=2 IF MAE / Hz | 主要分支 |
+| --- | ---: | ---: | --- |
+| linear | 0.699 | 1.328 | single / multi |
+| quadratic | 0.738 | 2.823 | single / multi |
+| cubic | 1.120 | 3.666 | single / multi |
+| sinusoidal_fm | 3.628 | 8.227 | all_expert |
+| crossing | 9.463 | 25.996 | all_expert |
+| near_parallel | 0.827 | 1.834 | single / multi |
+| local_jump | 1.261 | 3.274 | local_jump |
+| tangent_or_overlap | 7.574 | 10.127 | all_expert |
+
+这个结果说明 P1.5 已经达到“统一入口”和“稳定基线”的目的：简单场景和 local_jump 的表现稳定，near_parallel 在保守路由下没有被二峰启发式破坏；但 crossing 仍然是最明显短板，尤其是双分量 crossing 的 IF MAE 仍接近 `26 Hz`。
+
+### 19.4 `.npy` 信号推理验证
+
+P1.5 还新增了不依赖真实标签的单信号入口。测试时构造了一个一维 AM-FM 测试信号并保存为 `tmp/p15_test_signal.npy`，运行：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.infer_p15_signal --input-npy tmp\p15_test_signal.npy --output-dir stage2_iccd/runs/p15_pipeline/infer_smoke --fs 1024
+```
+
+输出结果：
+
+- 分支：`single`
+- active-count 预测：1 个活跃分量
+- active 置信度：99.46%
+- 输出完整 IF：`stage2_iccd/runs/p15_pipeline/infer_smoke/p15_if_hz.npy`
+- 输出活跃 IF：`stage2_iccd/runs/p15_pipeline/infer_smoke/p15_active_if_hz.npy`
+- 输出图片：`stage2_iccd/runs/p15_pipeline/infer_smoke/p15_inference.png`
+
+这说明后续真实信号或外部图像反推得到的时域信号，可以先通过 `.npy` 入口进入 P1.5 pipeline，再统一生成 STFT 叠加图和 IF 曲线。
+
+### 19.5 P1.5 完成判断与进入 P2 条件
+
+P1.5 可以认为已经完成以下闭环：
+
+- 已有 P1 分支被封装为统一 pipeline；
+- 仿真批量评估、分支比例统计、top-2 候选统计和图片输出已固定；
+- `.npy` 真实/外部信号推理入口已打通；
+- P1.5 默认组合已经明确，可以作为 P2 的输入基线。
+
+但进入 P2 前需要保留两个风险判断：
+
+1. `top-2 candidate weight coverage = 86.98%`，距离之前希望稳定超过 88% 还差约 1 个百分点。这个问题主要来自 all-expert 分支在 sinusoidal、crossing、tangent_or_overlap 上候选权重较分散。
+2. crossing 仍然没有真正解决。P1.5 通过 all-expert 分支降低了部分误差，但双分量 crossing 的重构和身份一致性仍然偏弱。
+
+因此，下一步可以进入 P2，但 P2 的第一件事不应是全面扩展真实数据或模型蒸馏，而应先围绕 crossing 做结构性修复：加入身份一致性损失、轨迹连续匹配、crossing 专项候选融合，或者在可微 ICCD 展开层中加入交叉点附近的局部重构约束。完成这个补强后，再推进 P2 的真实数据域适应和三分量扩展会更稳。
