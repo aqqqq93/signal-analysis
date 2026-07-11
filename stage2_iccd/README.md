@@ -61,6 +61,11 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `configs/all_multiexpert.yaml`: all-scenario training with several frozen IF-Net experts as candidate IF sources.
 - `configs/local_jump_frozen.yaml`: focused local-jump stage-2 specialist.
 - `configs/local_jump_segmented_p1.yaml`: P1 segmented local-jump refinement; uses jump-mask conditioning and separate smooth/jump refinement branches.
+- `configs/all_multiexpert_feature_attention_p1.yaml`: P1 multi-expert feature-attention candidate fusion.
+- `configs/all_multiexpert_ohem_p1.yaml`: P1 feature-attention plus scenario-level online hard-example mining.
+- `configs/simple_multicomponent_unfreeze_p1.yaml`: P1 decoder+head unfreeze probe; diagnostic only because it regressed against the frozen baseline.
+- `configs/simple_multicomponent_unfreeze_head_p1.yaml`: safer head-only unfreeze probe; diagnostic only, not the default checkpoint.
+- `configs/active_count_123_peak_p1.yaml`: P1 active-count router extended to 1/2/3 components with peak-count auxiliary features.
 - `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
 - `configs/default.yaml`: quick debug training with perturbed ground-truth IF candidates.
 - `configs/frozen_ifnet.yaml`: real stage-2 training initialized by a frozen stage-1 checkpoint.
@@ -170,6 +175,30 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/local_jump_segmented_p1/latest.pt --output-dir stage2_iccd/runs/local_jump_segmented_p1/eval_p1_compare --scenarios local_jump --batches 64 --batch-size 6 --snr-db-min -4 --snr-db-max 22 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
 ```
 
+P1 multi-expert feature-attention and OHEM:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/all_multiexpert_feature_attention_p1.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/all_multiexpert_ohem_p1.yaml
+```
+
+P1 hierarchical unfreeze probes:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/simple_multicomponent_unfreeze_p1.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/simple_multicomponent_unfreeze_head_p1.yaml
+```
+
+P1 active-count 1/2/3 router:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_active_count --config stage2_iccd/configs/active_count_123_peak_p1.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_active_count --checkpoint stage2_iccd/runs/active_count_123_peak_p1/latest.pt --output-dir stage2_iccd/runs/active_count_123_peak_p1/eval_p1_compare --scenarios linear quadratic cubic sinusoidal_fm near_parallel --active-components 1 2 3
+```
+
 Reference-style external signal analysis:
 
 ```powershell
@@ -198,3 +227,7 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 - `IFRefinementHead` supports `refinement_mode: segmented`. In this mode, the ordinary smooth branch handles non-jump regions and a separate jump branch handles the `jump_mask` region.
 - `train_stage2.build_refinement_extra` can convert simulator `jump_center`/`jump_valid` labels into Gaussian jump masks for the refinement head. This keeps local-jump supervision explicit without changing the frozen stage-1 IF-Net.
 - Old stage-2 checkpoints can initialize the segmented model: existing refinement weights are copied into the smooth branch, new condition channels are zero-initialized, and the jump branch is trained from scratch.
+- `CandidateMixer` supports `candidate_fusion: feature_attention`, which adds per-candidate residual, roughness, range, and distance-to-consensus features on top of the original residual gate.
+- `FrozenIFNetCandidateProvider` can optionally unfreeze the IF-Net head or the last decoder blocks. This provides the P1 hierarchical-unfreeze path while keeping the default stage-1 provider frozen.
+- `ActiveCountClassifier` now supports dynamic class counts. The P1 1/2/3-component router adds peak-count features to the existing ridge-shape auxiliary features.
+- `train_stage2` supports lightweight scenario-level OHEM by boosting scenarios whose validation IF MAE is in the current high-error tail.

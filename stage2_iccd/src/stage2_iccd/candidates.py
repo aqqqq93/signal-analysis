@@ -28,28 +28,44 @@ class FrozenIFNetCandidateProvider:
         num_candidates: int = 2,
         smooth_kernel: int = 31,
         checkpoints: list[str | Path] | None = None,
+        trainable: bool = False,
+        unfreeze_last_decoders: int = 0,
+        unfreeze_head: bool = True,
     ):
         paths = list(checkpoints or [])
         if checkpoint is not None:
             paths.insert(0, checkpoint)
         if not paths:
             raise ValueError("At least one frozen IF-Net checkpoint is required.")
+        self.trainable = bool(trainable)
         self.experts = [self._load_one(path, device) for path in paths]
         self.device = device
         self.num_candidates = max(1, int(num_candidates))
         self.smooth_kernel = int(smooth_kernel)
+        for model, _sim_cfg, _stft_cfg, _model_cfg in self.experts:
+            self._set_trainable_layers(
+                model,
+                trainable=self.trainable,
+                unfreeze_last_decoders=int(unfreeze_last_decoders),
+                unfreeze_head=bool(unfreeze_head),
+            )
 
-    @torch.no_grad()
     def __call__(self, signal: torch.Tensor, n_samples: int) -> torch.Tensor:
         candidates = []
-        for model, sim_cfg, stft_cfg, model_cfg in self.experts:
-            feats, freq_grid = log_spectrogram(signal, stft_cfg, sim_cfg.fs)
-            model_out = model(feats)
-            logits = model_out[0] if isinstance(model_out, tuple) else model_out
-            frame_if, _ = soft_argmax_if(logits, freq_grid, model_cfg.temperature)
-            candidates.append(F.interpolate(frame_if, size=n_samples, mode="linear", align_corners=False))
-            if len(candidates) >= self.num_candidates:
-                break
+        grad_context = torch.enable_grad() if self.trainable else torch.no_grad()
+        with grad_context:
+            for model, sim_cfg, stft_cfg, model_cfg in self.experts:
+                if self.trainable:
+                    model.train()
+                else:
+                    model.eval()
+                feats, freq_grid = log_spectrogram(signal, stft_cfg, sim_cfg.fs)
+                model_out = model(feats)
+                logits = model_out[0] if isinstance(model_out, tuple) else model_out
+                frame_if, _ = soft_argmax_if(logits, freq_grid, model_cfg.temperature)
+                candidates.append(F.interpolate(frame_if, size=n_samples, mode="linear", align_corners=False))
+                if len(candidates) >= self.num_candidates:
+                    break
         if self.num_candidates > 1:
             idx = 0
             while len(candidates) < self.num_candidates and idx < len(candidates):
@@ -58,6 +74,44 @@ class FrozenIFNetCandidateProvider:
         while len(candidates) < self.num_candidates:
             candidates.append(candidates[-1].clone())
         return torch.stack(candidates[: self.num_candidates], dim=1)
+
+    def parameters(self):
+        for model, _sim_cfg, _stft_cfg, _model_cfg in self.experts:
+            yield from model.parameters()
+
+    def trainable_parameters(self):
+        return [param for param in self.parameters() if param.requires_grad]
+
+    def state_dict(self) -> dict[str, dict[str, torch.Tensor]]:
+        return {f"expert_{idx}": model.state_dict() for idx, (model, *_rest) in enumerate(self.experts)}
+
+    def load_state_dict(self, state: dict[str, dict[str, torch.Tensor]]) -> None:
+        for idx, (model, *_rest) in enumerate(self.experts):
+            key = f"expert_{idx}"
+            if key in state:
+                model.load_state_dict(state[key])
+
+    @staticmethod
+    def _set_trainable_layers(
+        model: torch.nn.Module,
+        trainable: bool,
+        unfreeze_last_decoders: int,
+        unfreeze_head: bool,
+    ) -> None:
+        for param in model.parameters():
+            param.requires_grad_(False)
+        if not trainable:
+            model.eval()
+            return
+        if unfreeze_head and hasattr(model, "head"):
+            for param in model.head.parameters():
+                param.requires_grad_(True)
+        decoders = getattr(model, "decoders", None)
+        if decoders is not None and unfreeze_last_decoders > 0:
+            for block in list(decoders)[-unfreeze_last_decoders:]:
+                for param in block.parameters():
+                    param.requires_grad_(True)
+        model.train()
 
     @staticmethod
     def _load_one(path: str | Path, device: torch.device):

@@ -1045,3 +1045,139 @@ noise = white / colored / impulsive / trend 混合
 - 简单双分量和 near_parallel：继续使用 `simple_multicomponent_long` 配合 active-count router；
 - quality selector：继续作为诊断和后续多专家融合基础，不设为默认；
 - 下一步 P1 优先级：先把 `local_jump_segmented_p1` 接入 routed Stage2 的候选分支，再推进多专家软融合；最后再做端到端分层解冻。
+
+## 18. 2026-07-11 补充：P1 完整闭环结果
+
+在完成 local_jump 分段 refinement 后，本轮继续把 P1 剩余四项也全部落地并验证。P1 的目标不是简单再训练一个更大的模型，而是补上第二阶段中几个会影响后续真实任务的结构能力：
+
+1. 多专家候选不再只做全局平均，而是能按样本质量动态加权；
+2. IF-Net 和可微 ICCD 之间具备分层解冻、联合微调的代码路径；
+3. active-count router 从 1/2 分量扩展到 1/2/3 分量；
+4. 训练流程具备在线难样本挖掘能力，让困难场景在后续 epoch 中被更多采样。
+
+### 18.1 多专家 feature-attention 融合
+
+原来的 `all_multiexpert` 虽然能同时加载 balanced、polynomial、sinusoidal、local_jump 等多个 IF-Net 专家，但融合方式仍然偏保守：主要依赖候选重构残差和全局可学习偏置。这样做比盲目平均好，但仍有一个问题：不同样本里“哪个专家可靠”并不固定。例如 sinusoidal_fm 中 sinusoidal 专家更有优势，local_jump 中 jump 专家更重要，而 crossing 里某个候选的重构残差可能短时很好但身份不稳定。
+
+本轮在 `CandidateMixer` 中新增了 `candidate_fusion: feature_attention`。它不是直接让一个大网络重新预测 IF，而是给每个候选提取轻量质量特征：
+
+- 候选自己的 ICCD 初步重构残差；
+- 残差相对同批候选平均残差的比例；
+- IF 均值、标准差、最大/最小范围；
+- 一阶差分平均值，反映曲线斜率变化；
+- 二阶差分峰值，反映局部弯折或突变；
+- 候选与多专家候选中心的距离，反映它是不是离群候选。
+
+这些特征进入一个小型 MLP，输出每个候选的额外质量分数，再和原来的残差门控一起形成 softmax 权重。它的好处是：Stage2 不再只问“这个候选能不能重构当前信号”，还会问“这个候选自身的 IF 形状是否合理、是否过度离群、是否局部过弯”。
+
+对应配置为：
+
+- `stage2_iccd/configs/all_multiexpert_feature_attention_p1.yaml`
+- checkpoint：`stage2_iccd/runs/all_multiexpert_feature_attention_p1/latest.pt`
+
+独立评估结果如下：
+
+| 模型 | aggregate IF MAE / Hz | aggregate SNR / dB | crossing IF MAE / Hz | local_jump IF MAE / Hz | tangent/overlap IF MAE / Hz |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| all_multiexpert 基线 | 13.822 | 14.222 | 33.082 | 12.723 | 14.544 |
+| feature_attention_p1 | 11.209 | 15.928 | 29.832 | 9.506 | 13.408 |
+
+结论：feature-attention 是 P1 中最明确的全类型收益项。它没有完全解决 crossing，但把 aggregate IF MAE 降低约 `18.9%`，并同时提升重构 SNR，因此可以作为后续全类型多专家融合的主线。
+
+### 18.2 在线难样本挖掘 OHEM
+
+P1 的 OHEM 没有保存固定难样本，因为当前数据来自无限仿真，缓存具体波形反而会让训练过度记忆少数样本。本轮采用更轻的“场景级 OHEM”：
+
+1. 训练过程中按 `print_every` 做验证；
+2. 记录每个场景的验证 IF MAE；
+3. 找出当前误差处于高分位的场景；
+4. 在后续采样中提高这些场景的权重。
+
+代码位置：
+
+- `stage2_iccd/src/stage2_iccd/train_stage2.py`
+  - `evaluate(...)` 输出 `scenario_xxx_if_mae_hz`；
+  - `maybe_update_ohem_sampling(...)` 根据场景误差更新采样概率。
+
+对应配置为：
+
+- `stage2_iccd/configs/all_multiexpert_ohem_p1.yaml`
+- checkpoint：`stage2_iccd/runs/all_multiexpert_ohem_p1/latest.pt`
+
+独立评估结果如下：
+
+| 模型 | aggregate IF MAE / Hz | aggregate SNR / dB | crossing IF MAE / Hz | local_jump IF MAE / Hz | tangent/overlap IF MAE / Hz |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| feature_attention_p1 | 11.209 | 15.928 | 29.832 | 9.506 | 13.408 |
+| feature_attention + OHEM | 10.743 | 16.575 | 28.562 | 8.678 | 12.055 |
+
+结论：OHEM 有小幅但稳定的收益，尤其对 local_jump、crossing 和 tangent_or_overlap 这类困难场景更有帮助。因此当前全类型实验分支推荐使用 `all_multiexpert_ohem_p1`，但它仍不是简单单/双分量默认分支的替代品。
+
+### 18.3 分层解冻联合训练
+
+P1 中也实现了“先固定 IF-Net，重构稳定后再小学习率解冻 IF-Net 最后层”的代码路径。具体改动包括：
+
+- `FrozenIFNetCandidateProvider` 新增 `trainable`、`unfreeze_last_decoders`、`unfreeze_head`；
+- `train_stage2.make_optimizer(...)` 支持 Stage2 参数和 Stage1 参数使用不同学习率；
+- 训练 checkpoint 可以保存和恢复可训练 provider 的状态；
+- 默认情况下 provider 仍然完全冻结，旧流程不受影响。
+
+本轮做了两个实验：
+
+| 模型 | 解冻范围 | aggregate IF MAE / Hz | aggregate SNR / dB | 结论 |
+| --- | --- | ---: | ---: | --- |
+| simple_multicomponent_long 基线 | 不解冻 | 1.526 | 25.818 | 当前默认 |
+| unfreeze_p1 | head + 最后 2 个 decoder | 1.871 | 25.121 | 退化 |
+| unfreeze_head_p1 | 只解冻 head | 1.730 | 25.026 | 比激进解冻稳，但仍差于冻结基线 |
+
+结论：分层解冻的代码路径已经完成，但当前不进入默认训练策略。原因是 Stage2 已经能把简单场景修到很低误差，继续把梯度传回 IF-Net 容易破坏 Stage1 已有的稳定脊线输出。后续如果要重新推进端到端联合训练，应先在更困难的场景上使用更严格的门控，例如只对 high-confidence 且重构残差稳定下降的样本回传 Stage1 梯度，或者只解冻极少数归一化/输出层参数。
+
+### 18.4 active-count 1/2/3 分量扩展
+
+原 active-count router 只判断 1 分量或 2 分量。P1 中把它改为动态类别数，并新增峰值数量辅助特征：
+
+- `active_count_names(num_classes)` 动态生成 `active_1`、`active_2`、`active_3`；
+- checkpoint 保存 `active_count_names`，评估时按 checkpoint 自身类别加载；
+- `compute_peak_count_features(...)` 统计 STFT 频率方向 top 峰比例，用来提示“当前像几条明显脊线”；
+- routed Stage2 暂时采用兼容策略：`active_1` 走 single 分支，`active_2/active_3` 走 multi 分支。真正三分量 Stage2 需要后续单独训练 3 分量 IF-Net 和 3 分量 ICCD。
+
+对应配置为：
+
+- `stage2_iccd/configs/active_count_123_peak_p1.yaml`
+- checkpoint：`stage2_iccd/runs/active_count_123_peak_p1/latest.pt`
+
+独立评估结果：
+
+| 指标 | 数值 |
+| --- | ---: |
+| aggregate accuracy | 84.58% |
+| active_1 accuracy | 94.17% |
+| active_2 accuracy | 76.35% |
+| active_3 accuracy | 83.23% |
+| confidence | 70.48% |
+
+结论：1/2/3 active-count 原型已经可用，但不能直接替代当前 `active_count_simple_near_parallel`。主要短板是 active_2：两条接近平行或局部靠近的脊线容易被判断成 1 条宽脊线或 3 条峰。后续若要把三分量作为默认能力，需要补充 3 分量 Stage2 分支，并继续提升 active_2 与 near_parallel 的区分能力。
+
+### 18.5 P1 完成判断
+
+到目前为止，P1 可以认为已经完成工程闭环和效果筛选：
+
+- 分段 local_jump refinement：有效，local_jump 专项分支可保留；
+- 多专家 feature-attention：有效，是全类型融合的主线；
+- OHEM：有效，作为全类型训练增强保留；
+- 分层解冻：代码路径完成，但当前效果不如冻结基线，不设为默认；
+- active-count 1/2/3：原型完成，但不替代现有 1/2 router。
+
+当前推荐组合更新为：
+
+- 简单单分量：继续使用 `simple_single_component`；
+- 简单双分量和 near_parallel：继续使用 `simple_multicomponent_long` + `active_count_simple_near_parallel`；
+- local_jump：使用 `local_jump_segmented_p1` 作为专项分支；
+- 全类型多专家实验：使用 `all_multiexpert_ohem_p1`；
+- 三分量识别：保留 `active_count_123_peak_p1`，用于后续 3 分量 Stage2 准备；
+- 端到端解冻：暂不默认启用，只保留 `simple_multicomponent_unfreeze_head_p1` 作为安全解冻参考。
+
+下一阶段建议进入 P2 前先做两个收口动作：
+
+1. 把 `all_multiexpert_ohem_p1`、`local_jump_segmented_p1` 和现有 active-count router 封装到统一推理 pipeline，明确每类样本走哪个分支；
+2. 针对 crossing 单独增加身份一致性约束或轨迹匹配后处理，因为当前 P1 虽降低了 crossing 误差，但 crossing 仍然是全类型中最明显的短板。

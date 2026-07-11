@@ -60,20 +60,18 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     init_cfg = cfg.get("init", {})
     provider = make_candidate_provider(init_cfg, device=device, seed=seed)
     train_cfg = cfg["train"]
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(train_cfg.get("lr", 2.0e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 1.0e-6)),
-    )
+    optimizer = make_optimizer(model, provider, train_cfg)
 
     start_step = 0
     resume_path = train_cfg.get("resume")
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
         load_stage2_model_state(model, ckpt["model"])
+        if hasattr(provider, "load_state_dict") and "provider" in ckpt:
+            provider.load_state_dict(ckpt["provider"])
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
-        except ValueError:
+        except (KeyError, ValueError, RuntimeError):
             print("Optimizer state is incompatible with the current model; restarting optimizer.")
         start_step = int(ckpt.get("step", 0))
 
@@ -83,6 +81,7 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     save_every = int(train_cfg.get("save_every", 250))
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
     weights = train_cfg.get("loss", {})
+    ohem_cfg = train_cfg.get("ohem", {})
 
     history = []
     pbar = trange(1, steps + 1, desc="stage2-iccd")
@@ -96,7 +95,9 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         target_components = batch["components"]
         active_mask = batch.get("active_mask")
         candidate_if = get_candidates(provider, init_cfg, signal, target_if, sim_cfg.n_samples)
-        candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max).detach()
+        candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max)
+        if not bool(getattr(provider, "trainable", False)):
+            candidate_if = candidate_if.detach()
         refinement_extra = build_refinement_extra(batch, model_cfg, sim_cfg.n_samples, train_cfg.get("refinement_extra", {}))
 
         out = model(signal, candidate_if, refinement_extra=refinement_extra)
@@ -138,12 +139,13 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 train_cfg.get("refinement_extra", {}),
             )
             metrics.update({f"val_{k}": v for k, v in val.items()})
+            maybe_update_ohem_sampling(simulator, val, ohem_cfg)
             with (run_dir / "history.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics) + "\n")
 
         if step % save_every == 0 or step == steps:
-            save_checkpoint(run_dir / "latest.pt", model, optimizer, cfg, step)
-            save_checkpoint(run_dir / f"step_{step:06d}.pt", model, optimizer, cfg, step)
+            save_checkpoint(run_dir / "latest.pt", model, optimizer, cfg, step, provider=provider)
+            save_checkpoint(run_dir / f"step_{step:06d}.pt", model, optimizer, cfg, step, provider=provider)
 
     return {"run_dir": str(run_dir), "last": history[-1] if history else {}}
 
@@ -160,6 +162,9 @@ def make_candidate_provider(init_cfg: dict[str, Any], device: torch.device, seed
             device=device,
             num_candidates=int(init_cfg.get("num_candidates", 2)),
             smooth_kernel=int(init_cfg.get("smooth_kernel", 31)),
+            trainable=bool(init_cfg.get("trainable", False)),
+            unfreeze_last_decoders=int(init_cfg.get("unfreeze_last_decoders", 0)),
+            unfreeze_head=bool(init_cfg.get("unfreeze_head", True)),
         )
     if mode == "oracle_perturbed":
         return OraclePerturbedCandidateProvider(
@@ -170,6 +175,28 @@ def make_candidate_provider(init_cfg: dict[str, Any], device: torch.device, seed
             seed=seed,
         )
     raise ValueError(f"Unknown init.mode: {mode}")
+
+
+def make_optimizer(model: Stage2ICCDModel, provider, train_cfg: dict[str, Any]) -> torch.optim.Optimizer:
+    weight_decay = float(train_cfg.get("weight_decay", 1.0e-6))
+    groups: list[dict[str, Any]] = [
+        {
+            "params": list(model.parameters()),
+            "lr": float(train_cfg.get("lr", 2.0e-4)),
+            "weight_decay": weight_decay,
+        }
+    ]
+    if bool(getattr(provider, "trainable", False)) and hasattr(provider, "trainable_parameters"):
+        params = provider.trainable_parameters()
+        if params:
+            groups.append(
+                {
+                    "params": params,
+                    "lr": float(train_cfg.get("stage1_lr", 1.0e-5)),
+                    "weight_decay": float(train_cfg.get("stage1_weight_decay", weight_decay)),
+                }
+            )
+    return torch.optim.AdamW(groups)
 
 
 def get_candidates(provider, init_cfg: dict[str, Any], signal: torch.Tensor, target_if: torch.Tensor, n_samples: int) -> torch.Tensor:
@@ -299,6 +326,7 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     rows = []
+    scenario_rows: dict[str, list[dict[str, float]]] = {}
     for _ in range(num_batches):
         batch = simulator.generate_batch(batch_size, device=device)
         candidate_if = get_candidates(provider, init_cfg, batch["signal"], batch["if_hz"], sim_cfg.n_samples)
@@ -315,19 +343,63 @@ def evaluate(
             active_mask=batch.get("active_mask"),
         )
         rows.append(metrics)
-    return {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
+        for scenario in sorted(set(batch.get("scenario", []))):
+            indices = [idx for idx, name in enumerate(batch.get("scenario", [])) if name == scenario]
+            if not indices:
+                continue
+            idx_tensor = torch.tensor(indices, device=device)
+            sub_out = {key: value.index_select(0, idx_tensor) if isinstance(value, torch.Tensor) and value.shape[:1] == (len(batch["scenario"]),) else value for key, value in out.items()}
+            _loss, sub_metrics = compute_loss(
+                sub_out,
+                batch["clean"].index_select(0, idx_tensor),
+                batch["components"].index_select(0, idx_tensor),
+                batch["if_hz"].index_select(0, idx_tensor),
+                sim_cfg.fs,
+                weights,
+                active_mask=batch.get("active_mask").index_select(0, idx_tensor) if batch.get("active_mask") is not None else None,
+            )
+            scenario_rows.setdefault(scenario, []).append(sub_metrics)
+    merged = {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
+    for scenario, items in scenario_rows.items():
+        merged[f"scenario_{scenario}_if_mae_hz"] = float(np.mean([row["if_mae_hz"] for row in items]))
+    return merged
 
 
-def save_checkpoint(path: Path, model: Stage2ICCDModel, optimizer, cfg: dict[str, Any], step: int) -> None:
+def save_checkpoint(path: Path, model: Stage2ICCDModel, optimizer, cfg: dict[str, Any], step: int, provider=None) -> None:
+    payload = {
+        "step": step,
+        "config": cfg,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    if provider is not None and bool(getattr(provider, "trainable", False)) and hasattr(provider, "state_dict"):
+        payload["provider"] = provider.state_dict()
     torch.save(
-        {
-            "step": step,
-            "config": cfg,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        },
+        payload,
         path,
     )
+
+
+def maybe_update_ohem_sampling(simulator: ChirpSimulator, val: dict[str, float], ohem_cfg: dict[str, Any]) -> None:
+    if not ohem_cfg or not bool(ohem_cfg.get("enabled", False)):
+        return
+    scenario_mae = {
+        key.removeprefix("scenario_").removesuffix("_if_mae_hz"): value
+        for key, value in val.items()
+        if key.startswith("scenario_") and key.endswith("_if_mae_hz")
+    }
+    if not scenario_mae:
+        return
+    threshold = float(np.percentile(list(scenario_mae.values()), float(ohem_cfg.get("percentile", 80.0))))
+    boost = float(ohem_cfg.get("boost", 3.0))
+    base = dict(simulator.cfg.scenario_weights or {name: 1.0 for name in simulator.scenario_names})
+    updated = {}
+    for name in simulator.scenario_names:
+        value = float(base.get(name, 0.0))
+        if name in scenario_mae and scenario_mae[name] >= threshold:
+            value *= boost
+        updated[name] = value
+    simulator.scenario_probs = simulator._normalize_probs([updated[name] for name in simulator.scenario_names])
 
 
 def load_stage2_model_state(model: Stage2ICCDModel, state: dict[str, torch.Tensor]) -> None:
@@ -360,6 +432,7 @@ def load_stage2_model_state(model: Stage2ICCDModel, state: dict[str, torch.Tenso
     allowed_missing = {"mixer.raw_temperature"}
     real_missing = [key for key in missing if key not in allowed_missing]
     real_missing = [key for key in real_missing if not key.startswith("refine_head.jump_net.")]
+    real_missing = [key for key in real_missing if not key.startswith("mixer.quality_net.")]
     if real_missing or unexpected:
         raise RuntimeError(f"Could not load stage-2 checkpoint. missing={real_missing}, unexpected={unexpected}")
 

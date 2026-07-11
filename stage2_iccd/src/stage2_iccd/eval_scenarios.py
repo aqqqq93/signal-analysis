@@ -52,6 +52,8 @@ def evaluate_checkpoint(
 
     init_cfg = cfg.get("init", {})
     provider = make_candidate_provider(init_cfg, device=device, seed=int(cfg.get("seed", 0)) + 991)
+    if "provider" in ckpt and hasattr(provider, "load_state_dict"):
+        provider.load_state_dict(ckpt["provider"])
     weights = cfg["train"].get("loss", {})
     selected_scenarios = scenarios or list(SCENARIOS)
 

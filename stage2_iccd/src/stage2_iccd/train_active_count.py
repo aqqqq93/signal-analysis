@@ -16,10 +16,10 @@ from ifnet_stage1.simulation import ChirpSimulator, sim_config_from_dict
 from ifnet_stage1.tf import feature_channels, log_spectrogram, stft_config_from_dict
 
 from .active_count import (
-    ACTIVE_COUNT_NAMES,
     ActiveCountClassifier,
     active_count_config_from_dict,
     active_count_labels,
+    active_count_names,
     active_count_metrics,
 )
 
@@ -43,10 +43,11 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     sim_cfg = sim_config_from_dict(cfg["data"])
     stft_cfg = stft_config_from_dict(cfg["stft"])
     model_cfg = active_count_config_from_dict(cfg.get("active_count"))
+    names = active_count_names(model_cfg.num_classes)
     train_cfg = cfg["train"]
 
     simulator = ChirpSimulator(sim_cfg, seed=seed)
-    model = ActiveCountClassifier(feature_channels(stft_cfg), model_cfg, num_classes=len(ACTIVE_COUNT_NAMES)).to(device)
+    model = ActiveCountClassifier(feature_channels(stft_cfg), model_cfg, num_classes=len(names)).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(train_cfg.get("lr", 4.0e-4)),
@@ -78,7 +79,7 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         model.train()
         batch = simulator.generate_batch(batch_size, device=device)
         feats, _ = log_spectrogram(batch["signal"], stft_cfg, sim_cfg.fs)
-        labels = active_count_labels(batch["active_mask"])
+        labels = active_count_labels(batch["active_mask"], num_classes=len(names))
 
         logits = model(feats)
         loss = F.cross_entropy(logits, labels, weight=class_weights)
@@ -89,20 +90,20 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        metrics = active_count_metrics(logits.detach(), labels)
+        metrics = active_count_metrics(logits.detach(), labels, names=names)
         metrics.update({"step": step, "loss": float(loss.detach().cpu())})
         history.append(metrics)
         pbar.set_postfix(loss=f"{metrics['loss']:.4f}", acc=f"{metrics['accuracy']:.3f}", conf=f"{metrics['confidence']:.3f}")
 
         if step % print_every == 0:
-            val = evaluate(model, simulator, stft_cfg, sim_cfg.fs, batch_size, int(train_cfg.get("val_batches", 8)), device)
+            val = evaluate(model, simulator, stft_cfg, sim_cfg.fs, batch_size, int(train_cfg.get("val_batches", 8)), device, names)
             metrics.update({f"val_{key}": value for key, value in val.items()})
             with (run_dir / "history.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics) + "\n")
 
         if step % save_every == 0 or local_step == steps:
-            save_checkpoint(run_dir / "latest.pt", model, optimizer, cfg, model_cfg, step)
-            save_checkpoint(run_dir / f"step_{step:06d}.pt", model, optimizer, cfg, model_cfg, step)
+            save_checkpoint(run_dir / "latest.pt", model, optimizer, cfg, model_cfg, step, names)
+            save_checkpoint(run_dir / f"step_{step:06d}.pt", model, optimizer, cfg, model_cfg, step, names)
 
     return {"run_dir": str(run_dir), "last": history[-1] if history else {}}
 
@@ -116,6 +117,7 @@ def evaluate(
     batch_size: int,
     num_batches: int,
     device: torch.device,
+    names: tuple[str, ...],
 ) -> dict[str, float]:
     model.eval()
     losses = []
@@ -123,21 +125,21 @@ def evaluate(
     for _ in range(num_batches):
         batch = simulator.generate_batch(batch_size, device=device)
         feats, _ = log_spectrogram(batch["signal"], stft_cfg, fs)
-        labels = active_count_labels(batch["active_mask"])
+        labels = active_count_labels(batch["active_mask"], num_classes=len(names))
         logits = model(feats)
         losses.append(F.cross_entropy(logits, labels).detach())
-        rows.append(active_count_metrics(logits, labels))
+        rows.append(active_count_metrics(logits, labels, names=names))
     merged = {key: float(np.nanmean([row[key] for row in rows])) for key in rows[0]}
     merged["loss"] = float(torch.stack(losses).mean().cpu())
     return merged
 
 
-def save_checkpoint(path: Path, model, optimizer, cfg: dict[str, Any], model_cfg, step: int) -> None:
+def save_checkpoint(path: Path, model, optimizer, cfg: dict[str, Any], model_cfg, step: int, names: tuple[str, ...]) -> None:
     torch.save(
         {
             "step": step,
             "config": cfg,
-            "active_count_names": ACTIVE_COUNT_NAMES,
+            "active_count_names": names,
             "model_cfg": model_cfg.__dict__,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -150,7 +152,9 @@ def _class_weights(train_cfg: dict[str, Any], device: torch.device) -> torch.Ten
     raw = train_cfg.get("class_weights")
     if not raw:
         return None
-    values = [float(raw.get(name, 1.0)) for name in ACTIVE_COUNT_NAMES]
+    num_classes = len(raw) if all(str(key).startswith("active_") for key in raw) else int(train_cfg.get("num_classes", 2))
+    names = active_count_names(num_classes)
+    values = [float(raw.get(name, 1.0)) for name in names]
     return torch.tensor(values, dtype=torch.float32, device=device)
 
 

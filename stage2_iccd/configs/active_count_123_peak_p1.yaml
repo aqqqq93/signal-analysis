@@ -1,0 +1,67 @@
+seed: 20260727
+device: auto
+run_dir: stage2_iccd/runs/active_count_123_peak_p1
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 3
+  active_components:
+    1: 0.34
+    2: 0.43
+    3: 0.23
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -2.0
+  snr_db_max: 28.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 0.4
+    crossing: 0.2
+    near_parallel: 1.0
+    local_jump: 0.0
+    tangent_or_overlap: 0.0
+  noise_types:
+    white: 0.55
+    colored: 0.25
+    impulsive: 0.08
+    trend: 0.12
+
+stft:
+  hop_length: 4
+  target_n_fft: 256
+  log_eps: 1.0e-6
+  scales:
+    - n_fft: 128
+      win_length: 64
+    - n_fft: 256
+      win_length: 128
+    - n_fft: 512
+      win_length: 256
+
+active_count:
+  num_classes: 3
+  base_channels: 22
+  depth: 3
+  dropout: 0.10
+  use_aux_features: true
+  aux_feature_dim: 20
+  use_peak_features: true
+  peak_feature_dim: 8
+  aux_hidden: 48
+
+train:
+  steps: 650
+  batch_size: 28
+  lr: 0.00022
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 325
+  val_batches: 8
+  class_weights:
+    active_1: 1.0
+    active_2: 1.0
+    active_3: 1.2

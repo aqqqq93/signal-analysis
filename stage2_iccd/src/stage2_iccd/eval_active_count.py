@@ -16,10 +16,10 @@ from ifnet_stage1.simulation import SCENARIOS, ChirpSimulator, sim_config_from_d
 from ifnet_stage1.tf import feature_channels, log_spectrogram, stft_config_from_dict
 
 from .active_count import (
-    ACTIVE_COUNT_NAMES,
     ActiveCountClassifier,
     active_count_config_from_dict,
     active_count_labels,
+    active_count_names,
     active_count_metrics,
 )
 from .eval_scenarios import parse_noise_types
@@ -41,7 +41,8 @@ def evaluate_checkpoint(
     cfg = ckpt["config"]
     stft_cfg = stft_config_from_dict(cfg["stft"])
     model_cfg = active_count_config_from_dict(ckpt.get("model_cfg", cfg.get("active_count")))
-    model = ActiveCountClassifier(feature_channels(stft_cfg), model_cfg, num_classes=len(ACTIVE_COUNT_NAMES)).to(device)
+    names = tuple(ckpt.get("active_count_names", active_count_names(model_cfg.num_classes)))
+    model = ActiveCountClassifier(feature_channels(stft_cfg), model_cfg, num_classes=len(names)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -62,10 +63,10 @@ def evaluate_checkpoint(
             for _ in range(batches):
                 batch = simulator.generate_batch(batch_size, device=device)
                 feats, _ = log_spectrogram(batch["signal"], stft_cfg, sim_cfg.fs)
-                labels = active_count_labels(batch["active_mask"])
+                labels = active_count_labels(batch["active_mask"], num_classes=len(names))
                 logits = model(feats)
                 losses.append(F.cross_entropy(logits, labels).detach())
-                metric_rows.append(active_count_metrics(logits, labels))
+                metric_rows.append(active_count_metrics(logits, labels, names=names))
             row = {
                 "scenario": scenario,
                 "active_components": int(active),

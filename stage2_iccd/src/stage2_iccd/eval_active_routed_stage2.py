@@ -14,7 +14,7 @@ from ifnet_stage1.config import choose_device
 from ifnet_stage1.simulation import SCENARIOS, ChirpSimulator, sim_config_from_dict
 from ifnet_stage1.tf import feature_channels, log_spectrogram, stft_config_from_dict
 
-from .active_count import ActiveCountClassifier, active_count_config_from_dict, active_count_labels
+from .active_count import ActiveCountClassifier, active_count_config_from_dict, active_count_labels, active_count_names
 from .differentiable_iccd import iccd_config_from_dict
 from .eval_scenarios import parse_noise_types
 from .model import Stage2ICCDModel, stage2_model_config_from_dict
@@ -47,6 +47,8 @@ class Stage2Bundle:
         self.model.eval()
         self.init_cfg = self.cfg.get("init", {})
         self.provider = make_candidate_provider(self.init_cfg, device=device, seed=int(self.cfg.get("seed", 0)) + 131)
+        if "provider" in ckpt and hasattr(self.provider, "load_state_dict"):
+            self.provider.load_state_dict(ckpt["provider"])
         self.weights = self.cfg["train"].get("loss", {})
         self.refinement_extra_cfg = self.cfg.get("train", {}).get("refinement_extra", {})
 
@@ -81,7 +83,8 @@ def evaluate_routed(
     active_cfg = active_ckpt["config"]
     stft_cfg = stft_config_from_dict(active_cfg["stft"])
     active_model_cfg = active_count_config_from_dict(active_ckpt.get("model_cfg", active_cfg.get("active_count")))
-    active_model = ActiveCountClassifier(feature_channels(stft_cfg), active_model_cfg).to(device)
+    active_names = tuple(active_ckpt.get("active_count_names", active_count_names(active_model_cfg.num_classes)))
+    active_model = ActiveCountClassifier(feature_channels(stft_cfg), active_model_cfg, num_classes=len(active_names)).to(device)
     active_model.load_state_dict(active_ckpt["model"])
     active_model.eval()
 
@@ -110,13 +113,15 @@ def evaluate_routed(
                 logits = active_model(feats)
                 probs = torch.softmax(logits, dim=1)
                 pred = probs.argmax(dim=1)
-                labels = active_count_labels(batch["active_mask"])
+                labels = active_count_labels(batch["active_mask"], num_classes=len(active_names))
                 route_acc.append((pred == labels).float().mean().detach())
                 route_conf.append(probs.max(dim=1).values.mean().detach())
                 route_to_single.append((pred == 0).float().mean().detach())
 
-                for pred_label, bundle in ((0, single), (1, multi)):
-                    mask = pred == pred_label
+                for route_name, mask, bundle in (
+                    ("single", pred == 0, single),
+                    ("multi", pred >= 1, multi),
+                ):
                     if not bool(mask.any()):
                         continue
                     sub_batch = _slice_batch(batch, mask)
@@ -131,6 +136,7 @@ def evaluate_routed(
                         active_mask=sub_batch.get("active_mask"),
                     )
                     metrics["num_samples"] = float(mask.float().sum().detach().cpu())
+                    metrics["route_multi_group"] = 1.0 if route_name == "multi" else 0.0
                     metric_rows.append(metrics)
             row = {
                 "scenario": scenario,

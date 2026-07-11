@@ -14,6 +14,9 @@ class Stage2ModelConfig:
     num_candidates: int = 2
     refine_channels: int = 32
     refine_layers: int = 3
+    candidate_fusion: str = "residual"
+    candidate_feature_dim: int = 8
+    candidate_hidden: int = 24
     refinement_mode: str = "standard"
     refine_extra_channels: int = 0
     max_refine_hz: float = 35.0
@@ -29,6 +32,9 @@ def stage2_model_config_from_dict(data: dict) -> Stage2ModelConfig:
         num_candidates=int(data.get("num_candidates", 2)),
         refine_channels=int(data.get("refine_channels", 32)),
         refine_layers=int(data.get("refine_layers", 3)),
+        candidate_fusion=str(data.get("candidate_fusion", "residual")),
+        candidate_feature_dim=int(data.get("candidate_feature_dim", 8)),
+        candidate_hidden=int(data.get("candidate_hidden", 24)),
         refinement_mode=str(data.get("refinement_mode", "standard")),
         refine_extra_channels=int(data.get("refine_extra_channels", 0)),
         max_refine_hz=float(data.get("max_refine_hz", 35.0)),
@@ -49,13 +55,35 @@ class CandidateMixer(nn.Module):
     persistent preference for stronger candidate sources.
     """
 
-    def __init__(self, num_candidates: int, temperature: float, temperature_min: float):
+    def __init__(
+        self,
+        num_candidates: int,
+        temperature: float,
+        temperature_min: float,
+        fusion: str = "residual",
+        feature_dim: int = 8,
+        hidden: int = 24,
+    ):
         super().__init__()
         if num_candidates < 1:
             raise ValueError("num_candidates must be at least 1.")
+        self.fusion = str(fusion)
+        if self.fusion not in {"bias", "residual", "feature_attention"}:
+            raise ValueError(f"Unknown candidate fusion mode: {self.fusion}")
         self.bias = nn.Parameter(torch.zeros(num_candidates))
         self.raw_temperature = nn.Parameter(_inverse_softplus(torch.tensor(max(temperature - temperature_min, 1.0e-6))))
         self.temperature_min = float(temperature_min)
+        self.feature_dim = max(1, int(feature_dim))
+        self.quality_net = (
+            nn.Sequential(
+                nn.LayerNorm(self.feature_dim),
+                nn.Linear(self.feature_dim, int(hidden)),
+                nn.SiLU(),
+                nn.Linear(int(hidden), 1),
+            )
+            if self.fusion == "feature_attention"
+            else None
+        )
 
     @property
     def temperature(self) -> torch.Tensor:
@@ -71,20 +99,57 @@ class CandidateMixer(nn.Module):
             raise ValueError(f"Expected candidates [B, C, Q, N], got {tuple(candidate_if_hz.shape)}")
         num_candidates = candidate_if_hz.shape[1]
         bias = self.bias[:num_candidates]
-        if signal is not None and iccd is not None:
-            residual_scores = []
-            with torch.no_grad():
-                for idx in range(num_candidates):
-                    out = iccd(signal, candidate_if_hz[:, idx])
-                    residual = (out["reconstruction"] - signal).pow(2).mean(dim=-1)
-                    residual_scores.append(residual)
-            residual_score = torch.stack(residual_scores, dim=1)
-            logits = bias.view(1, -1) - residual_score / self.temperature.clamp_min(self.temperature_min)
-            weights = torch.softmax(logits, dim=1)
-        else:
+        if self.fusion == "bias" or signal is None or iccd is None:
             weights = torch.softmax(bias, dim=0).view(1, -1).expand(candidate_if_hz.shape[0], -1)
+        else:
+            residual_score = self._residual_scores(candidate_if_hz, signal, iccd)
+            logits = bias.view(1, -1) - residual_score / self.temperature.clamp_min(self.temperature_min)
+            if self.quality_net is not None:
+                features = self._candidate_features(candidate_if_hz, residual_score)
+                quality = self.quality_net(features.reshape(-1, features.shape[-1])).view(features.shape[:2])
+                logits = logits + quality
+            weights = torch.softmax(logits, dim=1)
         mixed = (candidate_if_hz * weights.view(candidate_if_hz.shape[0], num_candidates, 1, 1)).sum(dim=1)
         return mixed, weights
+
+    @staticmethod
+    def _residual_scores(
+        candidate_if_hz: torch.Tensor,
+        signal: torch.Tensor,
+        iccd: DifferentiableICCD,
+    ) -> torch.Tensor:
+        residual_scores = []
+        with torch.no_grad():
+            for idx in range(candidate_if_hz.shape[1]):
+                out = iccd(signal, candidate_if_hz[:, idx])
+                residual = (out["reconstruction"] - signal).pow(2).mean(dim=-1)
+                residual_scores.append(residual)
+        return torch.stack(residual_scores, dim=1)
+
+    def _candidate_features(self, candidate_if_hz: torch.Tensor, residual_score: torch.Tensor) -> torch.Tensor:
+        bsz, num_candidates, _num_components, _n = candidate_if_hz.shape
+        first = candidate_if_hz[..., 1:] - candidate_if_hz[..., :-1]
+        second = first[..., 1:] - first[..., :-1] if first.shape[-1] > 1 else first.new_zeros(first.shape)
+        center = candidate_if_hz.mean(dim=1, keepdim=True)
+        dist_to_center = (candidate_if_hz - center).abs().mean(dim=(-1, -2))
+        stats = torch.stack(
+            [
+                residual_score,
+                residual_score / residual_score.mean(dim=1, keepdim=True).clamp_min(1.0e-8),
+                candidate_if_hz.mean(dim=(-1, -2)) / 500.0,
+                candidate_if_hz.std(dim=(-1, -2)) / 500.0,
+                candidate_if_hz.amax(dim=(-1, -2)) / 500.0,
+                candidate_if_hz.amin(dim=(-1, -2)) / 500.0,
+                first.abs().mean(dim=(-1, -2)) / 50.0,
+                second.abs().amax(dim=(-1, -2)) / 50.0,
+                dist_to_center / 100.0,
+            ],
+            dim=-1,
+        )
+        if stats.shape[-1] < self.feature_dim:
+            pad = stats.new_zeros((bsz, num_candidates, self.feature_dim - stats.shape[-1]))
+            stats = torch.cat([stats, pad], dim=-1)
+        return stats[..., : self.feature_dim]
 
 
 class IFRefinementHead(nn.Module):
@@ -173,6 +238,9 @@ class Stage2ICCDModel(nn.Module):
             model_cfg.num_candidates,
             temperature=model_cfg.candidate_temperature,
             temperature_min=model_cfg.candidate_temperature_min,
+            fusion=model_cfg.candidate_fusion,
+            feature_dim=model_cfg.candidate_feature_dim,
+            hidden=model_cfg.candidate_hidden,
         )
         self.refine_head = IFRefinementHead(
             num_components=num_components,

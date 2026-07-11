@@ -1,0 +1,76 @@
+seed: 20260728
+device: auto
+run_dir: stage2_iccd/runs/all_multiexpert_ohem_p1
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -4.0
+  snr_db_max: 22.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 1.0
+    crossing: 0.8
+    near_parallel: 1.0
+    local_jump: 1.0
+    tangent_or_overlap: 0.8
+  noise_types:
+    white: 0.55
+    colored: 0.25
+    impulsive: 0.10
+    trend: 0.10
+
+init:
+  mode: frozen_ifnet_checkpoint
+  num_candidates: 4
+  smooth_kernel: 31
+  checkpoints:
+    - ifnet_stage1/runs/balanced_refit_resume/latest.pt
+    - ifnet_stage1/runs/polynomial_refit_resume/latest.pt
+    - ifnet_stage1/runs/sinusoidal_refit/latest.pt
+    - ifnet_stage1/runs/local_jump_aux_v3/latest.pt
+
+iccd:
+  amplitude_order: 10
+  period_factor: 2.0
+  alpha_init: 1.0
+  alpha_min: 0.00001
+  solve_jitter: 0.000001
+
+model:
+  num_candidates: 4
+  candidate_fusion: feature_attention
+  candidate_feature_dim: 8
+  candidate_hidden: 32
+  refine_channels: 40
+  refine_layers: 3
+  max_refine_hz: 42.0
+  candidate_temperature: 0.018
+  candidate_temperature_min: 0.001
+
+train:
+  resume: stage2_iccd/runs/all_multiexpert_feature_attention_p1/latest.pt
+  steps: 350
+  batch_size: 6
+  lr: 0.00008
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  print_every: 50
+  save_every: 175
+  val_batches: 5
+  ohem:
+    enabled: true
+    percentile: 80.0
+    boost: 2.5
+  loss:
+    reconstruction: 1.0
+    component: 0.20
+    if_l1: 0.09
+    smooth: 0.0005
+    delta: 0.0004
+    candidate_entropy: 0.0005
