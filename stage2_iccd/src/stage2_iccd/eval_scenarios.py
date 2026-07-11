@@ -14,7 +14,13 @@ from ifnet_stage1.simulation import SCENARIOS, ChirpSimulator, sim_config_from_d
 
 from .differentiable_iccd import iccd_config_from_dict
 from .model import Stage2ICCDModel, stage2_model_config_from_dict
-from .train_stage2 import compute_loss, get_candidates, load_stage2_model_state, make_candidate_provider
+from .train_stage2 import (
+    build_refinement_extra,
+    compute_loss,
+    get_candidates,
+    load_stage2_model_state,
+    make_candidate_provider,
+)
 
 
 @torch.no_grad()
@@ -62,7 +68,13 @@ def evaluate_checkpoint(
             batch = simulator.generate_batch(batch_size, device=device)
             candidate_if = get_candidates(provider, init_cfg, batch["signal"], batch["if_hz"], sim_cfg.n_samples)
             candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max).detach()
-            out = model(batch["signal"], candidate_if)
+            refinement_extra = build_refinement_extra(
+                batch,
+                model.model_cfg,
+                sim_cfg.n_samples,
+                cfg.get("train", {}).get("refinement_extra", {}),
+            )
+            out = model(batch["signal"], candidate_if, refinement_extra=refinement_extra)
             _, metrics = compute_loss(
                 out,
                 batch["clean"],

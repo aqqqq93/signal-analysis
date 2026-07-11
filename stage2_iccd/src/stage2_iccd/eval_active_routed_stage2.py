@@ -18,7 +18,13 @@ from .active_count import ActiveCountClassifier, active_count_config_from_dict, 
 from .differentiable_iccd import iccd_config_from_dict
 from .eval_scenarios import parse_noise_types
 from .model import Stage2ICCDModel, stage2_model_config_from_dict
-from .train_stage2 import compute_loss, get_candidates, load_stage2_model_state, make_candidate_provider
+from .train_stage2 import (
+    build_refinement_extra,
+    compute_loss,
+    get_candidates,
+    load_stage2_model_state,
+    make_candidate_provider,
+)
 
 
 class Stage2Bundle:
@@ -42,12 +48,19 @@ class Stage2Bundle:
         self.init_cfg = self.cfg.get("init", {})
         self.provider = make_candidate_provider(self.init_cfg, device=device, seed=int(self.cfg.get("seed", 0)) + 131)
         self.weights = self.cfg["train"].get("loss", {})
+        self.refinement_extra_cfg = self.cfg.get("train", {}).get("refinement_extra", {})
 
     @torch.no_grad()
     def run(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         candidate_if = get_candidates(self.provider, self.init_cfg, batch["signal"], batch["if_hz"], batch["if_hz"].shape[-1])
         candidate_if = candidate_if.clamp(self.sim_cfg.freq_min, self.sim_cfg.freq_max).detach()
-        return self.model(batch["signal"], candidate_if)
+        refinement_extra = build_refinement_extra(
+            batch,
+            self.model.model_cfg,
+            batch["if_hz"].shape[-1],
+            self.refinement_extra_cfg,
+        )
+        return self.model(batch["signal"], candidate_if, refinement_extra=refinement_extra)
 
 
 @torch.no_grad()

@@ -97,8 +97,9 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         active_mask = batch.get("active_mask")
         candidate_if = get_candidates(provider, init_cfg, signal, target_if, sim_cfg.n_samples)
         candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max).detach()
+        refinement_extra = build_refinement_extra(batch, model_cfg, sim_cfg.n_samples, train_cfg.get("refinement_extra", {}))
 
-        out = model(signal, candidate_if)
+        out = model(signal, candidate_if, refinement_extra=refinement_extra)
         loss, metrics = compute_loss(out, clean, target_components, target_if, sim_cfg.fs, weights, active_mask=active_mask)
 
         optimizer.zero_grad(set_to_none=True)
@@ -124,7 +125,18 @@ def train_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
         )
 
         if step % print_every == 0:
-            val = evaluate(model, simulator, provider, init_cfg, sim_cfg, weights, batch_size, int(train_cfg.get("val_batches", 4)), device)
+            val = evaluate(
+                model,
+                simulator,
+                provider,
+                init_cfg,
+                sim_cfg,
+                weights,
+                batch_size,
+                int(train_cfg.get("val_batches", 4)),
+                device,
+                train_cfg.get("refinement_extra", {}),
+            )
             metrics.update({f"val_{k}": v for k, v in val.items()})
             with (run_dir / "history.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics) + "\n")
@@ -164,6 +176,39 @@ def get_candidates(provider, init_cfg: dict[str, Any], signal: torch.Tensor, tar
     if str(init_cfg.get("mode", "oracle_perturbed")) == "frozen_ifnet_checkpoint":
         return provider(signal, n_samples)
     return provider(signal, target_if)
+
+
+def build_refinement_extra(
+    batch: dict[str, Any],
+    model_cfg,
+    n_samples: int,
+    cfg: dict[str, Any] | None = None,
+) -> torch.Tensor | None:
+    channels = int(getattr(model_cfg, "refine_extra_channels", 0))
+    if channels <= 0:
+        return None
+    signal = batch["signal"]
+    device = signal.device
+    dtype = signal.dtype
+    cfg = cfg or {}
+    mode = str(cfg.get("mode", "jump_mask"))
+    if mode != "jump_mask":
+        return signal.new_zeros((signal.shape[0], channels, n_samples))
+    centers = batch.get("jump_center")
+    valid = batch.get("jump_valid")
+    if centers is None or valid is None:
+        return signal.new_zeros((signal.shape[0], channels, n_samples))
+    centers = centers.to(device=device, dtype=dtype)
+    valid = valid.to(device=device, dtype=torch.bool)
+    time = torch.linspace(0.0, 1.0, n_samples, device=device, dtype=dtype)
+    sigma = float(cfg.get("sigma", 0.035))
+    sigma = max(sigma, 1.0 / max(float(n_samples), 1.0))
+    masks = torch.exp(-0.5 * ((time.view(1, 1, -1) - centers.unsqueeze(-1)) / sigma) ** 2)
+    masks = masks * valid.to(dtype=dtype).unsqueeze(-1)
+    if masks.shape[1] < channels:
+        pad = masks.new_zeros((masks.shape[0], channels - masks.shape[1], n_samples))
+        masks = torch.cat([masks, pad], dim=1)
+    return masks[:, :channels].clamp(0.0, 1.0)
 
 
 def compute_loss(
@@ -250,6 +295,7 @@ def evaluate(
     batch_size: int,
     num_batches: int,
     device: torch.device,
+    refinement_extra_cfg: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     model.eval()
     rows = []
@@ -257,7 +303,8 @@ def evaluate(
         batch = simulator.generate_batch(batch_size, device=device)
         candidate_if = get_candidates(provider, init_cfg, batch["signal"], batch["if_hz"], sim_cfg.n_samples)
         candidate_if = candidate_if.clamp(sim_cfg.freq_min, sim_cfg.freq_max).detach()
-        out = model(batch["signal"], candidate_if)
+        refinement_extra = build_refinement_extra(batch, model.model_cfg, sim_cfg.n_samples, refinement_extra_cfg)
+        out = model(batch["signal"], candidate_if, refinement_extra=refinement_extra)
         _, metrics = compute_loss(
             out,
             batch["clean"],
@@ -295,9 +342,24 @@ def load_stage2_model_state(model: Stage2ICCDModel, state: dict[str, torch.Tenso
     migrated = dict(state)
     if "mixer.logits" in migrated and "mixer.bias" not in migrated:
         migrated["mixer.bias"] = migrated.pop("mixer.logits")
+    current = model.state_dict()
+    for key, value in list(migrated.items()):
+        if key not in current or tuple(value.shape) == tuple(current[key].shape):
+            continue
+        if key == "refine_head.net.0.weight" and value.ndim == 3 and current[key].ndim == 3:
+            fixed = current[key].clone()
+            fixed.zero_()
+            out_ch = min(fixed.shape[0], value.shape[0])
+            in_ch = min(fixed.shape[1], value.shape[1])
+            width = min(fixed.shape[2], value.shape[2])
+            fixed[:out_ch, :in_ch, :width] = value[:out_ch, :in_ch, :width]
+            migrated[key] = fixed
+            continue
+        migrated.pop(key)
     missing, unexpected = model.load_state_dict(migrated, strict=False)
     allowed_missing = {"mixer.raw_temperature"}
     real_missing = [key for key in missing if key not in allowed_missing]
+    real_missing = [key for key in real_missing if not key.startswith("refine_head.jump_net.")]
     if real_missing or unexpected:
         raise RuntimeError(f"Could not load stage-2 checkpoint. missing={real_missing}, unexpected={unexpected}")
 

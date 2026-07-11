@@ -941,3 +941,107 @@ checkpoint：`stage2_iccd/runs/simple_single_component/latest.pt`
 - 多项式专项：保留 `poly_multicomponent_refine` 作为候选，不直接默认替换；
 - quality selector：保留 `stage2_quality_selector_p0_context`，用于后续多专家融合和 hard-sample 诊断；
 - 下一阶段再处理 P1：分段 refinement、多专家软融合、端到端分层解冻。
+
+## 17. 2026-07-11 补充：P1 第一项，local_jump 分段 refinement
+
+P0 完成之后，下一步按优先级先处理 P1 里的 local_jump 分段 refinement。原因是前面的评估已经说明，local_jump 的主要瓶颈不是 ICCD 层不能重构，也不是普通训练步数不够，而是跳变点附近的 IF 形状和普通连续 IF 的形状不一样。普通 refinement head 倾向于做全局平滑、小幅修正；这对 linear、quadratic、near_parallel 这类连续曲线是好事，但对 local_jump 会把真正应该快速变化的位置抹平，导致跳变点前后 IF 偏移。
+
+### 17.1 本轮改动的核心原理
+
+原来的 Stage2 refinement head 可以理解为一个统一修正器：
+
+```text
+refined_if(t) = candidate_if(t) + delta_if(t)
+```
+
+这里的 `delta_if(t)` 由同一个 1D-CNN 生成。问题是它不知道哪些时间点是平稳段，哪些时间点是跳变段，所以只能学一个折中策略：既不能在跳变点改得太激进，也不能在平稳段完全不平滑。
+
+本轮新增的分段 refinement 把这个过程拆成两个分支：
+
+```text
+delta_if(t) =
+    smooth_delta(t) * (1 - jump_mask(t))
+  + jump_delta(t)   * jump_mask(t)
+
+refined_if(t) = candidate_if(t) + delta_if(t)
+```
+
+其中：
+
+- `smooth_delta(t)` 负责普通平稳段，仍然保持较强平滑和较小修正幅度；
+- `jump_delta(t)` 只在跳变区域起主要作用，允许比平稳段更大的局部修正；
+- `jump_mask(t)` 由仿真数据中的 `jump_center` 和 `jump_valid` 生成，当前使用高斯形状的软 mask，而不是硬 0/1，这样跳变附近的过渡区也能被覆盖。
+
+这一步没有解冻第一阶段 IF-Net。也就是说，Stage1 仍然只负责给出初始 IF 候选；Stage2 通过显式 `jump_mask` 条件输入学习“哪里应该允许局部快速修正”。这符合当前路线：先固定 IF-Net，把可微 ICCD 展开层和 refinement 结构训练稳定，再考虑端到端联合训练。
+
+### 17.2 代码实现位置
+
+本轮主要改动如下：
+
+- `stage2_iccd/src/stage2_iccd/model.py`
+  - `Stage2ModelConfig` 新增 `refinement_mode` 和 `max_jump_refine_hz`；
+  - `IFRefinementHead` 新增 `segmented` 模式；
+  - `Stage2ICCDModel` 可以把 `refinement_extra` 传入 refinement head；
+  - 旧 checkpoint 仍可用，默认 `standard` 模式不改变原模型行为。
+
+- `stage2_iccd/src/stage2_iccd/train_stage2.py`
+  - 新增 `build_refinement_extra(...)`；
+  - 训练和验证时会根据 batch 里的 `jump_center`、`jump_valid` 构造 `jump_mask`；
+  - 加入旧 checkpoint 到新结构的权重迁移：旧 refinement 第一层卷积权重复制到新 smooth 分支，新增条件通道用 0 初始化，jump 分支从头训练。
+
+- `stage2_iccd/src/stage2_iccd/eval_scenarios.py`
+  - 分场景评估时也会根据 checkpoint config 自动构造 `refinement_extra`，保证训练和评估一致。
+
+- `stage2_iccd/src/stage2_iccd/eval_active_routed_stage2.py`
+  - routed Stage2 评估路径同步支持 `refinement_extra`，后续把 local_jump 分支接入路由时不需要再改主体流程。
+
+- `stage2_iccd/configs/local_jump_segmented_p1.yaml`
+  - 新增 local_jump 专项配置；
+  - 使用 `refinement_mode: segmented`；
+  - 使用 `refine_extra_channels: 2`，对应两个 IF 输出槽的 jump mask；
+  - 平稳段 `max_refine_hz` 为 26 Hz，跳变段 `max_jump_refine_hz` 为 70 Hz；
+  - 从 `stage2_iccd/runs/local_jump_frozen/latest.pt` 初始化，继续只训练 Stage2。
+
+### 17.3 训练和独立评估结果
+
+本轮训练时先遇到一个预期内的问题：旧的 local_jump checkpoint 第一层 refinement 卷积输入通道是 3，而新模型因为加入两个 jump-mask 条件通道，输入通道变成 5。直接加载会出现 shape mismatch。这个问题已经通过权重迁移解决：旧权重复制到已有通道，新通道置零，优化器状态不兼容时重新初始化优化器。
+
+独立评估使用相同的 local_jump 鲁棒设置：
+
+```text
+scenario = local_jump
+batches = 64
+batch_size = 6
+SNR range = -4 dB 到 22 dB
+noise = white / colored / impulsive / trend 混合
+```
+
+| 模型 | IF MAE / Hz | 重构 SNR / dB | smooth | delta RMS / Hz | component L1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| local_jump_frozen 基线 | 9.536 | 15.203 | 32.306 | 2.993 | 0.1365 |
+| local_jump_segmented_p1 | 8.086 | 15.788 | 14.075 | 1.819 | 0.1309 |
+
+这个结果说明分段 refinement 的方向是有效的：
+
+1. IF MAE 从 `9.536 Hz` 降到 `8.086 Hz`，约下降 `15.2%`；
+2. 重构 SNR 从 `15.203 dB` 提升到 `15.788 dB`，说明 IF 修正没有牺牲重构稳定性；
+3. smooth 从 `32.306` 降到 `14.075`，说明模型没有通过制造大量不规则抖动来追 IF；
+4. delta RMS 从 `2.993 Hz` 降到 `1.819 Hz`，说明修正幅度整体更克制，但在 jump mask 区域更有针对性。
+
+### 17.4 当前结论和边界
+
+这一步可以认为已经完成 P1 第一项的首轮有效闭环：代码路径打通，旧 checkpoint 能迁移，训练能正常进行，独立评估优于 local_jump_frozen 基线。
+
+但它还不能直接替代全部 Stage2 默认流程，原因有三点：
+
+1. 这次只针对 local_jump 专项训练，没有证明它对 linear、quadratic、cubic、sinusoidal_fm、crossing 等类型都无回退；
+2. 当前 `jump_mask` 来自仿真标签 `jump_center`，后续真实信号中需要由 Stage1 jump auxiliary 或其他事件检测模块提供；
+3. crossing 的核心问题是身份一致性和轨迹交换，不能只靠 jump 分段修正解决。
+
+因此当前推荐策略是：
+
+- local_jump 专项分支：优先使用 `local_jump_segmented_p1`；
+- 简单单分量：继续使用 `simple_single_component`；
+- 简单双分量和 near_parallel：继续使用 `simple_multicomponent_long` 配合 active-count router；
+- quality selector：继续作为诊断和后续多专家融合基础，不设为默认；
+- 下一步 P1 优先级：先把 `local_jump_segmented_p1` 接入 routed Stage2 的候选分支，再推进多专家软融合；最后再做端到端分层解冻。

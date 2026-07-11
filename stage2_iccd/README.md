@@ -60,6 +60,7 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `configs/simple_active_mixed_p0_conservative.yaml`: conservative active-mask training recipe that reduces single-component leakage while limiting two-component regression.
 - `configs/all_multiexpert.yaml`: all-scenario training with several frozen IF-Net experts as candidate IF sources.
 - `configs/local_jump_frozen.yaml`: focused local-jump stage-2 specialist.
+- `configs/local_jump_segmented_p1.yaml`: P1 segmented local-jump refinement; uses jump-mask conditioning and separate smooth/jump refinement branches.
 - `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
 - `configs/default.yaml`: quick debug training with perturbed ground-truth IF candidates.
 - `configs/frozen_ifnet.yaml`: real stage-2 training initialized by a frozen stage-1 checkpoint.
@@ -161,6 +162,14 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/simple_active_mixed_p0_conservative/latest.pt --output-dir stage2_iccd/runs/simple_active_mixed_p0_conservative/eval_single_active --scenarios linear quadratic cubic near_parallel --active-components 1
 ```
 
+P1 segmented local-jump refinement:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/local_jump_segmented_p1.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/local_jump_segmented_p1/latest.pt --output-dir stage2_iccd/runs/local_jump_segmented_p1/eval_p1_compare --scenarios local_jump --batches 64 --batch-size 6 --snr-db-min -4 --snr-db-max 22 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
 Reference-style external signal analysis:
 
 ```powershell
@@ -181,5 +190,11 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 ## Current P0 Optimization Hooks
 
 - Active-component component loss now uses the ground-truth active mask before component matching and adds an inactive-slot energy penalty. This prevents a one-component signal from being silently split across two reconstructed output slots.
-- `Stage2ModelConfig.refine_extra_channels` and `Stage2ICCDModel.forward(..., refinement_extra=...)` reserve a clean interface for later `jump_mask` or `jump_prob` conditioning. The default remains zero extra channels, so existing checkpoints keep loading normally.
+- `Stage2ModelConfig.refine_extra_channels` and `Stage2ICCDModel.forward(..., refinement_extra=...)` provide the condition-input interface for `jump_mask` or `jump_prob` conditioning. The default remains zero extra channels, so existing checkpoints keep loading normally.
 - The supervised quality selector is implemented as a lightweight MLP over deployment-safe branch features: reconstruction residuals, branch residual ratios, IF difference statistics, smoothness, range, curvature, candidate entropy, Stage1 router confidence, active-count confidence, identity-consistency cues, and local curvature-jump cues. It is currently a diagnostic branch chooser, not yet the default production route.
+
+## Current P1 Optimization Hooks
+
+- `IFRefinementHead` supports `refinement_mode: segmented`. In this mode, the ordinary smooth branch handles non-jump regions and a separate jump branch handles the `jump_mask` region.
+- `train_stage2.build_refinement_extra` can convert simulator `jump_center`/`jump_valid` labels into Gaussian jump masks for the refinement head. This keeps local-jump supervision explicit without changing the frozen stage-1 IF-Net.
+- Old stage-2 checkpoints can initialize the segmented model: existing refinement weights are copied into the smooth branch, new condition channels are zero-initialized, and the jump branch is trained from scratch.

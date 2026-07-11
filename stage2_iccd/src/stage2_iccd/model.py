@@ -14,8 +14,10 @@ class Stage2ModelConfig:
     num_candidates: int = 2
     refine_channels: int = 32
     refine_layers: int = 3
+    refinement_mode: str = "standard"
     refine_extra_channels: int = 0
     max_refine_hz: float = 35.0
+    max_jump_refine_hz: float = 0.0
     freq_min: float = 35.0
     freq_max: float = 430.0
     candidate_temperature: float = 0.02
@@ -27,8 +29,10 @@ def stage2_model_config_from_dict(data: dict) -> Stage2ModelConfig:
         num_candidates=int(data.get("num_candidates", 2)),
         refine_channels=int(data.get("refine_channels", 32)),
         refine_layers=int(data.get("refine_layers", 3)),
+        refinement_mode=str(data.get("refinement_mode", "standard")),
         refine_extra_channels=int(data.get("refine_extra_channels", 0)),
         max_refine_hz=float(data.get("max_refine_hz", 35.0)),
+        max_jump_refine_hz=float(data.get("max_jump_refine_hz", data.get("max_refine_hz", 35.0))),
         freq_min=float(data.get("freq_min", 35.0)),
         freq_max=float(data.get("freq_max", 430.0)),
         candidate_temperature=float(data.get("candidate_temperature", 0.02)),
@@ -86,13 +90,33 @@ class CandidateMixer(nn.Module):
 class IFRefinementHead(nn.Module):
     """Small 1D refinement head for residual IF correction."""
 
-    def __init__(self, num_components: int, channels: int, layers: int, max_refine_hz: float, extra_channels: int = 0):
+    def __init__(
+        self,
+        num_components: int,
+        channels: int,
+        layers: int,
+        max_refine_hz: float,
+        extra_channels: int = 0,
+        mode: str = "standard",
+        max_jump_refine_hz: float | None = None,
+    ):
         super().__init__()
+        self.num_components = int(num_components)
         self.max_refine_hz = float(max_refine_hz)
+        self.max_jump_refine_hz = float(max_refine_hz if max_jump_refine_hz is None else max_jump_refine_hz)
         self.extra_channels = max(0, int(extra_channels))
+        self.mode = str(mode)
+        if self.mode not in {"standard", "segmented"}:
+            raise ValueError(f"Unknown refinement mode: {self.mode}")
         hidden = max(4, int(channels))
+        in_channels = num_components + 1 + self.extra_channels
+        self.net = self._make_net(in_channels, hidden, layers, num_components)
+        self.jump_net = self._make_net(in_channels, hidden, layers, num_components) if self.mode == "segmented" else None
+
+    @staticmethod
+    def _make_net(in_channels: int, hidden: int, layers: int, num_components: int) -> nn.Sequential:
         blocks: list[nn.Module] = [
-            nn.Conv1d(num_components + 1 + self.extra_channels, hidden, kernel_size=7, padding=3),
+            nn.Conv1d(in_channels, hidden, kernel_size=7, padding=3),
             nn.SiLU(),
         ]
         for _ in range(max(0, int(layers) - 1)):
@@ -104,9 +128,18 @@ class IFRefinementHead(nn.Module):
                 ]
             )
         blocks.append(nn.Conv1d(hidden, num_components, kernel_size=3, padding=1))
-        self.net = nn.Sequential(*blocks)
+        return nn.Sequential(*blocks)
 
     def forward(self, signal: torch.Tensor, if_hz: torch.Tensor, extra: torch.Tensor | None = None) -> torch.Tensor:
+        features = self._features(signal, if_hz, extra)
+        smooth_delta = self.max_refine_hz * torch.tanh(self.net(features))
+        if self.jump_net is None:
+            return smooth_delta
+        jump_delta = self.max_jump_refine_hz * torch.tanh(self.jump_net(features))
+        gate = self._jump_gate(signal, extra)
+        return smooth_delta * (1.0 - gate) + jump_delta * gate
+
+    def _features(self, signal: torch.Tensor, if_hz: torch.Tensor, extra: torch.Tensor | None) -> torch.Tensor:
         signal_norm = signal / signal.std(dim=-1, keepdim=True).clamp_min(1.0e-6)
         if_norm = if_hz / if_hz.detach().amax(dim=-1, keepdim=True).clamp_min(1.0)
         parts = [if_norm, signal_norm.unsqueeze(1)]
@@ -118,8 +151,16 @@ class IFRefinementHead(nn.Module):
             if extra.shape[1] != self.extra_channels:
                 raise ValueError(f"Expected {self.extra_channels} refinement extra channels, got {extra.shape[1]}")
             parts.append(extra)
-        features = torch.cat(parts, dim=1)
-        return self.max_refine_hz * torch.tanh(self.net(features))
+        return torch.cat(parts, dim=1)
+
+    def _jump_gate(self, signal: torch.Tensor, extra: torch.Tensor | None) -> torch.Tensor:
+        if extra is None or extra.shape[1] <= 0:
+            return signal.new_zeros((signal.shape[0], self.num_components, signal.shape[-1]))
+        gate = extra[:, : min(self.num_components, extra.shape[1])].clamp(0.0, 1.0)
+        if gate.shape[1] < self.num_components:
+            pad = gate.new_zeros((gate.shape[0], self.num_components - gate.shape[1], gate.shape[-1]))
+            gate = torch.cat([gate, pad], dim=1)
+        return gate
 
 
 class Stage2ICCDModel(nn.Module):
@@ -139,6 +180,8 @@ class Stage2ICCDModel(nn.Module):
             layers=model_cfg.refine_layers,
             max_refine_hz=model_cfg.max_refine_hz,
             extra_channels=model_cfg.refine_extra_channels,
+            mode=model_cfg.refinement_mode,
+            max_jump_refine_hz=model_cfg.max_jump_refine_hz,
         )
         self.iccd = DifferentiableICCD(iccd_cfg)
 
