@@ -42,6 +42,7 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `src/stage2_iccd/pipeline.py`: P1.5 stable inference wrapper over the current best single/multi/local-jump/all-expert branches.
 - `src/stage2_iccd/eval_p15_pipeline.py`: P1.5 all-scenario routed evaluation and visualization.
 - `src/stage2_iccd/infer_p15_signal.py`: `.npy` time-domain signal inference entrypoint for the P1.5 pipeline.
+- `src/stage2_iccd/p3_real_signal_pipeline.py`: P3 directory-level real/external `.npy` entrypoint with domain-gap diagnostics, P2.5 inference, and HTML reporting.
 - `src/stage2_iccd/domain_adaptation.py`: P2 STFT-domain gap diagnostic for folders of real or external `.npy` signals.
 - `src/stage2_iccd/train_tiny_distill.py`: P2 Tiny-IF-Net distillation from the routed Stage2 teacher.
 - `src/stage2_iccd/p2_report.py`: P2 HTML report builder for routed metrics and generated plots.
@@ -249,6 +250,20 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/three_component_stft_candidate_p25_conservative/latest.pt --output-dir stage2_iccd/runs/three_component_stft_candidate_p25_conservative/eval_p25 --scenarios linear quadratic cubic near_parallel --batches 32 --batch-size 5 --snr-db-min 2 --snr-db-max 26
 ```
 
+P3 real/external signal entry:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.p3_real_signal_pipeline --npy-dir path\to\npy_signals --output-dir stage2_iccd/runs/p3_real_signal_entry --max-files 16
+```
+
+Optional scenario hints can be supplied when a file is known to be crossing-like:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.p3_real_signal_pipeline --npy-dir path\to\npy_signals --output-dir stage2_iccd/runs/p3_real_signal_entry --scenario-hints-json "{crossing_sample:crossing}"
+```
+
 P2 domain-gap diagnostic and HTML report:
 
 ```powershell
@@ -319,3 +334,10 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 - The all-scenario P2.5 pipeline reaches aggregate top-2 candidate coverage `91.18%`, above the previous `88%` gate.
 - `STFTPeakCandidateProvider` is the first non-oracle three-component candidate generator. With `min_gap_hz: 10` and conservative refinement, simple/near-parallel three-component validation reaches aggregate IF MAE around `9.33 Hz` without using true IF labels as candidates.
 - These three gates are sufficient to enter P3, but P3 should keep the STFT ridge candidate path as a baseline rather than treating it as a final replacement for a learned three-component IF-Net.
+
+## Current P3 Entry
+
+- `infer_p15_signal.py` now defaults to the P2.5 crossing checkpoint and saves both raw `refined_if_hz` and visualization-friendly `identity_stable_if_hz`. Crossing-hinted samples plot the raw refined IF to avoid the old identity-stabilization artifact.
+- `p3_real_signal_pipeline.py` is the first P3 entrypoint: it scans a directory of `.npy` signals, runs STFT domain-gap diagnostics, runs P2.5 routed inference for each file, and writes `p3_summary.json` plus `p3_report.html`.
+- P3 keeps Stage1 frozen. The report only decides whether Stage2-only tuning is reasonable; it does not automatically fine-tune any checkpoint.
+- Smoke output was generated under `stage2_iccd/runs/p3_real_signal_entry_smoke` from two temporary synthetic `.npy` signals. The crossing-like sample routed to the P2.5 crossing branch with top-2 weight sum `1.0`; the simple two-component sample routed to the multi branch.

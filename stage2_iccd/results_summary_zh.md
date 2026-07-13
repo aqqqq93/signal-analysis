@@ -1614,3 +1614,97 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 3. 如果 domain gap 不大，优先只微调 Stage2 的 refinement 和候选选择层；
 4. 如果 domain gap 很大，再考虑扩充仿真库或做 Stage2-only 域适应；
 5. 暂时不要把 STFT 真实候选当成最终三分量方案，它更适合作为 P3 初期的非 oracle baseline。
+
+## 22. 2026-07-13 补充：正式进入 P3
+
+P2.5 的三个闸门已经达标后，本轮正式进入 P3。这里的“进入 P3”不是立刻大规模解冻 Stage1，也不是马上开始真实数据端到端训练，而是先把真实/外部 `.npy` 信号进入系统的流程固定下来。原因是：真实信号没有仿真标签，若没有统一入口、domain gap 诊断和可视化报告，后续很难判断误差来自数据域差、候选 IF、路由器，还是可微 ICCD 展开层。
+
+### 22.1 P3 入口做了什么
+
+本轮新增目录级 P3 入口：
+
+- `stage2_iccd/src/stage2_iccd/p3_real_signal_pipeline.py`
+
+它完成以下工作：
+
+1. 扫描一个目录下的 `.npy` 一维时域信号；
+2. 对这些信号运行 STFT domain gap 诊断；
+3. 对每个信号调用 P2.5 routed Stage2 pipeline；
+4. 输出每个信号的 IF 曲线、活跃 IF 曲线、STFT+IF 叠加图；
+5. 汇总生成 `p3_summary.json` 和 `p3_report.html`；
+6. 根据 domain gap 给出“先做 Stage2-only 微调，还是先扩充仿真库”的建议。
+
+命令格式如下：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.p3_real_signal_pipeline --npy-dir path\to\npy_signals --output-dir stage2_iccd/runs/p3_real_signal_entry --max-files 16
+```
+
+如果某个文件已知是 crossing-like，可以用场景 hint 强制走 P2.5 crossing 分支：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.p3_real_signal_pipeline --npy-dir path\to\npy_signals --output-dir stage2_iccd/runs/p3_real_signal_entry --scenario-hints-json "{crossing_sample:crossing}"
+```
+
+这里的 hint 支持文件名或不带后缀的 stem，例如 `crossing_like`。
+
+### 22.2 单信号推理入口同步升级
+
+原来的 `infer_p15_signal.py` 也做了同步升级：
+
+- 默认接入 `stage2_iccd/runs/crossing_first_candidate_p25/latest.pt`；
+- 保存 `p15_refined_if_hz.npy` 和 `p15_identity_stable_if_hz.npy` 两套 IF；
+- crossing hint 样本默认用 raw `refined_if_hz` 出图，避免旧的 identity-stable 后处理把正确 crossing 轨迹换坏；
+- 默认把输入信号标准化到 `1024` 点窗口，与当前 Stage2/ICCD checkpoint 的样本长度一致。
+
+这一步很重要。P2.5 已经证明 crossing 的 raw refined IF 是正确指标，而旧后处理只适合一般可视化，不适合作为 crossing 指标。
+
+### 22.3 P3 smoke 验证
+
+由于当前工作区没有用户提供的真实 `.npy` 信号，本轮先生成了两个临时 smoke 信号验证入口：
+
+- `tmp/p3_smoke_signals/crossing_like.npy`
+- `tmp/p3_smoke_signals/simple_two_component.npy`
+
+运行命令：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.p3_real_signal_pipeline --npy-dir tmp\p3_smoke_signals --output-dir stage2_iccd/runs/p3_real_signal_entry_smoke --max-files 2 --scenario-hints-json "{crossing_like:crossing}"
+```
+
+输出文件：
+
+- `stage2_iccd/runs/p3_real_signal_entry_smoke/domain_summary.json`
+- `stage2_iccd/runs/p3_real_signal_entry_smoke/p3_summary.json`
+- `stage2_iccd/runs/p3_real_signal_entry_smoke/p3_report.html`
+- 每个信号各自的 `p15_inference.png`、`p15_if_hz.npy`、`p15_active_if_hz.npy`
+
+smoke 结果摘要：
+
+| 信号 | 路由分支 | active 预测 | active 置信度 | top-2 权重和 | 出图 IF |
+| --- | --- | ---: | ---: | ---: | --- |
+| crossing_like.npy | crossing | 2 | 0.9996 | 1.0000 | refined_if_hz |
+| simple_two_component.npy | multi | 2 | 0.9992 | 1.0000 | identity_stable_if_hz |
+
+domain gap 诊断：
+
+| 指标 | 数值 |
+| --- | ---: |
+| feature_l1 | 0.179 |
+| feature_l2 | 0.924 |
+| num_files | 2 |
+
+报告给出的建议是：domain gap 已经“可见但不算极端”，因此下一步应先检查 IF 叠加图，再优先尝试 Stage2-only 的 refinement 或候选选择层微调，而不是直接解冻 Stage1。
+
+### 22.4 P3 当前边界
+
+当前 P3 已经完成的是入口工程化和 smoke 验证，不是最终真实数据适应。明确边界如下：
+
+1. P3 pipeline 不自动训练，也不改 checkpoint；
+2. 当前仍默认 Stage1 冻结；
+3. 真实信号需要先被整理成一维 `.npy`，当前默认窗口长度为 `1024` 点；
+4. 如果真实信号长度不同，入口会插值到 1024 点，但频率解释仍应按当前模型的 1024 Hz / 1 秒窗口理解；
+5. 下一步真正的 P3 优化应基于真实信号报告来决定，是做 Stage2-only 微调、扩充仿真库，还是训练更强的真实候选/三分量 IF-Net。
