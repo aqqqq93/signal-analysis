@@ -174,7 +174,10 @@ def save_p15_plot(
 ) -> None:
     signal = batch["signal"][0].detach().cpu()
     target = batch["if_hz"][0].detach().cpu()
-    pred = out["identity_stable_if_hz"][0].detach().cpu()
+    scenario = str(batch["scenario"][0])
+    pred_key = "refined_if_hz" if scenario == "crossing" and "refined_if_hz" in out else "identity_stable_if_hz"
+    pred_label = "refined" if pred_key == "refined_if_hz" else "stable"
+    pred = out[pred_key][0].detach().cpu()
     active_mask = batch["active_mask"][0].detach().cpu()
     spec, freq, frame_times = spectrogram_for_plot(signal, fs)
     sample_times = np.arange(signal.shape[-1]) / fs
@@ -189,13 +192,14 @@ def save_p15_plot(
     )
     for idx in torch.where(active_mask > 0.5)[0].tolist():
         ax.plot(sample_times, target[idx], color="#35e56a", linewidth=1.5, label="true IF" if idx == 0 else None)
-        ax.plot(sample_times, pred[idx], color="#ffcc33", linestyle="--", linewidth=1.35, label="P1.5 IF" if idx == 0 else None)
+        ax.plot(sample_times, pred[idx], color="#ffcc33", linestyle="--", linewidth=1.35, label="P2.5 IF" if idx == 0 else None)
     ax.set_ylim(0.0, freq_max + 75.0)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Frequency (Hz)")
     ax.set_title(
-        f"{batch['scenario'][0]} | active={int(active_mask.sum().item())} | "
-        f"branch={route['branch'][0]} | conf={float(route['active_confidence'][0]):.3f}"
+        f"{scenario} | active={int(active_mask.sum().item())} | "
+        f"branch={route['branch'][0]} | conf={float(route['active_confidence'][0]):.3f} | {pred_label}",
+        fontsize=10,
     )
     ax.grid(alpha=0.16, linewidth=0.6)
     ax.legend(loc="upper right", fontsize=8)

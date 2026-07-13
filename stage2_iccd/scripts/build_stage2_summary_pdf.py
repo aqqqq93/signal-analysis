@@ -11,7 +11,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,6 +154,10 @@ def build_story(markdown: str, styles: dict[str, ParagraphStyle]) -> list:
             story.append(Spacer(1, 3))
             idx += 1
             continue
+        if is_image_line(line):
+            story.extend(markdown_image(line, styles))
+            idx += 1
+            continue
         if is_table_start(lines, idx):
             table_lines = []
             while idx < len(lines) and lines[idx].strip().startswith("|"):
@@ -187,6 +192,42 @@ def build_story(markdown: str, styles: dict[str, ParagraphStyle]) -> list:
     if code_lines:
         story.append(Paragraph("<br/>".join(escape_inline(item) for item in code_lines), styles["code"]))
     return story
+
+
+def is_image_line(line: str) -> bool:
+    return bool(re.match(r"^!\[[^\]]*\]\([^)]+\)\s*$", line.strip()))
+
+
+def markdown_image(line: str, styles: dict[str, ParagraphStyle]) -> list:
+    match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$", line.strip())
+    if not match:
+        return []
+    caption, raw_path = match.groups()
+    image_path = resolve_image_path(raw_path)
+    if not image_path.exists():
+        return [Paragraph(f"Image not found: {escape_inline(raw_path)}", styles["body"])]
+    image = RLImage(str(image_path))
+    max_width = A4[0] - 2.9 * cm
+    max_height = 20.5 * cm
+    scale = min(max_width / image.drawWidth, max_height / image.drawHeight, 1.0)
+    image.drawWidth *= scale
+    image.drawHeight *= scale
+    items = []
+    if caption.strip():
+        items.append(Paragraph(escape_inline(caption.strip()), styles["h2"]))
+    items.append(image)
+    items.append(Spacer(1, 6))
+    return [KeepTogether(items)]
+
+
+def resolve_image_path(raw_path: str) -> Path:
+    path = Path(raw_path.strip().strip("\"'"))
+    if path.is_absolute():
+        return path
+    repo_candidate = REPO_ROOT / path
+    if repo_candidate.exists():
+        return repo_candidate
+    return SOURCE_MD.parent / path
 
 
 def is_table_start(lines: list[str], idx: int) -> bool:

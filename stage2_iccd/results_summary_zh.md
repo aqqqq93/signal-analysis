@@ -1708,3 +1708,71 @@ domain gap 诊断：
 3. 真实信号需要先被整理成一维 `.npy`，当前默认窗口长度为 `1024` 点；
 4. 如果真实信号长度不同，入口会插值到 1024 点，但频率解释仍应按当前模型的 1024 Hz / 1 秒窗口理解；
 5. 下一步真正的 P3 优化应基于真实信号报告来决定，是做 Stage2-only 微调、扩充仿真库，还是训练更强的真实候选/三分量 IF-Net。
+
+## 23. 2026-07-13 补充：各类仿真信号可视化验证图
+
+在进入真实信号验证前，本轮先重新生成一组覆盖全部仿真类型的 P2.5 可视化验证图，并把图放入 PDF。这样做的目的不是重新训练模型，而是给后续真实信号对比提供一个“仿真域内正常表现”的视觉基线：如果真实信号图像明显偏离这些仿真图，就优先怀疑 domain gap、信号预处理或候选 IF 生成，而不是直接解冻 Stage1。
+
+本轮验证覆盖 8 类双分量 active=2 仿真信号：
+
+1. linear chirp；
+2. quadratic polynomial chirp；
+3. cubic polynomial chirp；
+4. sinusoidal_fm；
+5. crossing；
+6. near_parallel；
+7. local_jump；
+8. tangent_or_overlap。
+
+运行命令：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir output\figures\sim_validation_p3 --scenarios linear quadratic cubic sinusoidal_fm crossing near_parallel local_jump tangent_or_overlap --active-components 2 --batches 4 --batch-size 4 --plots-per-case 1 --crossing-checkpoint stage2_iccd\runs\crossing_first_candidate_p25\latest.pt --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+总体指标：
+
+| 指标 | 数值 |
+| --- | ---: |
+| aggregate IF MAE | 4.118 Hz |
+| aggregate reconstruction SNR | 20.804 dB |
+| top-2 candidate coverage | 92.56% |
+| active route accuracy | 88.28% |
+
+分场景 IF MAE：
+
+| 场景 | IF MAE / Hz | top-2 覆盖 | 主要分支 |
+| --- | ---: | ---: | --- |
+| linear | 2.59 | 100.00% | multi |
+| quadratic | 1.21 | 100.00% | multi |
+| cubic | 2.81 | 100.00% | multi |
+| sinusoidal_fm | 7.64 | 66.48% | all_expert |
+| crossing | 4.71 | 100.00% | crossing |
+| near_parallel | 2.07 | 100.00% | multi |
+| local_jump | 2.31 | 100.00% | local_jump |
+| tangent_or_overlap | 9.60 | 73.98% | all_expert |
+
+需要注意：crossing 图已改为显示 raw `refined_if_hz`，不再显示 `identity_stable_if_hz`。这是因为前面已经验证过，identity-stable 后处理在 crossing 上会把本来正确的轨迹换坏，不能作为 crossing 的可视化和指标依据。
+
+![八类仿真信号验证总览](output/figures/sim_validation_p3/overview.png)
+
+### 23.1 单类仿真验证图
+
+![linear 双分量验证图](output/figures/sim_validation_p3/plots/linear_active2_sample0.png)
+
+![quadratic 双分量验证图](output/figures/sim_validation_p3/plots/quadratic_active2_sample0.png)
+
+![cubic 双分量验证图](output/figures/sim_validation_p3/plots/cubic_active2_sample0.png)
+
+![sinusoidal_fm 双分量验证图](output/figures/sim_validation_p3/plots/sinusoidal_fm_active2_sample0.png)
+
+![crossing 双分量验证图](output/figures/sim_validation_p3/plots/crossing_active2_sample0.png)
+
+![near_parallel 双分量验证图](output/figures/sim_validation_p3/plots/near_parallel_active2_sample0.png)
+
+![local_jump 双分量验证图](output/figures/sim_validation_p3/plots/local_jump_active2_sample0.png)
+
+![tangent_or_overlap 双分量验证图](output/figures/sim_validation_p3/plots/tangent_or_overlap_active2_sample0.png)
+
+从图上可以看到，linear、quadratic、cubic、near_parallel、local_jump 和 crossing 的预测 IF 基本贴住主要能量脊线。sinusoidal_fm 和 tangent_or_overlap 仍然是相对困难类型，主要表现为候选权重更分散、局部曲率更大、预测线在部分时间段略有抖动。这两个类型后续如果在真实信号中也经常出现，应优先继续优化 all_expert 分支和候选融合，而不是只针对 crossing 或 local_jump 调参。
