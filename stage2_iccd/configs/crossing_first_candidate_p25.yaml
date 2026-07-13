@@ -1,0 +1,73 @@
+seed: 20260811
+device: auto
+run_dir: stage2_iccd/runs/crossing_first_candidate_p25
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 2
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: -4.0
+  snr_db_max: 22.0
+  scenario_weights:
+    linear: 0.0
+    quadratic: 0.0
+    cubic: 0.0
+    sinusoidal_fm: 0.0
+    crossing: 1.0
+    near_parallel: 0.0
+    local_jump: 0.0
+    tangent_or_overlap: 0.0
+  noise_types:
+    white: 0.55
+    colored: 0.25
+    impulsive: 0.10
+    trend: 0.10
+
+init:
+  mode: frozen_ifnet_checkpoint
+  num_candidates: 4
+  smooth_kernel: 31
+  checkpoints:
+    - ifnet_stage1/runs/balanced_refit_resume/latest.pt
+    - ifnet_stage1/runs/polynomial_refit_resume/latest.pt
+    - ifnet_stage1/runs/sinusoidal_refit/latest.pt
+    - ifnet_stage1/runs/local_jump_aux_v3/latest.pt
+
+iccd:
+  amplitude_order: 10
+  period_factor: 2.0
+  alpha_init: 1.0
+  alpha_min: 0.00001
+  solve_jitter: 0.000001
+
+model:
+  num_candidates: 4
+  candidate_fusion: first
+  refine_channels: 40
+  refine_layers: 3
+  max_refine_hz: 12.0
+  candidate_temperature: 0.018
+  candidate_temperature_min: 0.001
+
+train:
+  resume: stage2_iccd/runs/crossing_identity_p2/latest.pt
+  steps: 160
+  batch_size: 6
+  lr: 0.00005
+  weight_decay: 0.000001
+  grad_clip: 0.8
+  print_every: 40
+  save_every: 80
+  val_batches: 4
+  loss:
+    reconstruction: 1.0
+    component: 0.22
+    if_l1: 0.16
+    smooth: 0.00055
+    third_derivative: 0.00025
+    crossing_identity: 0.0025
+    crossing_gap_sigma_hz: 30.0
+    delta: 0.00055
+    candidate_entropy: 0.0

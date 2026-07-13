@@ -161,3 +161,117 @@ class OraclePerturbedCandidateProvider:
             extra_noise = torch.randn(target_if_hz.shape, generator=self.generator, device="cpu").to(target_if_hz.device)
             candidates.append(target_if_hz + self.alt_noise_hz * extra_noise)
         return torch.stack(candidates[: self.num_candidates], dim=1)
+
+
+class STFTPeakCandidateProvider:
+    """Deployment-safe IF candidates from STFT peak ridges.
+
+    This provider does not use ground-truth IF. It extracts the strongest
+    separated frequency peaks in each STFT frame, converts them to coarse IF
+    tracks, and returns raw/smoothed variants as Stage2 candidates.
+    """
+
+    signal_only = True
+
+    def __init__(
+        self,
+        num_components: int,
+        num_candidates: int = 2,
+        fs: float = 1024.0,
+        n_fft: int = 256,
+        win_length: int = 128,
+        hop_length: int = 4,
+        freq_min: float = 35.0,
+        freq_max: float = 430.0,
+        min_gap_hz: float = 24.0,
+        centroid_radius: int = 2,
+        smooth_kernel: int = 31,
+        alt_smooth_kernel: int = 61,
+        device: torch.device | None = None,
+    ):
+        self.num_components = max(1, int(num_components))
+        self.num_candidates = max(1, int(num_candidates))
+        self.fs = float(fs)
+        self.n_fft = int(n_fft)
+        self.win_length = int(win_length)
+        self.hop_length = int(hop_length)
+        self.freq_min = float(freq_min)
+        self.freq_max = float(freq_max)
+        self.min_gap_hz = float(min_gap_hz)
+        self.centroid_radius = max(0, int(centroid_radius))
+        self.smooth_kernel = int(smooth_kernel)
+        self.alt_smooth_kernel = int(alt_smooth_kernel)
+        self.device = device
+
+    def __call__(self, signal: torch.Tensor, n_samples: int) -> torch.Tensor:
+        device = signal.device if self.device is None else self.device
+        signal = signal.to(device)
+        window = torch.hann_window(self.win_length, device=device, dtype=signal.dtype)
+        spec = torch.stft(
+            signal,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+        mag = spec.abs()
+        freqs = torch.linspace(0.0, self.fs / 2.0, self.n_fft // 2 + 1, device=device, dtype=signal.dtype)
+        freq_mask = (freqs >= self.freq_min) & (freqs <= self.freq_max)
+        if int(freq_mask.sum().item()) < self.num_components:
+            raise ValueError("STFT frequency mask is too narrow for the requested component count.")
+        local_mag = mag[:, freq_mask, :]
+        local_freqs = freqs[freq_mask]
+        frame_tracks = self._frame_peaks(local_mag, local_freqs)
+        frame_tracks = frame_tracks.sort(dim=1).values
+        tracks = F.interpolate(frame_tracks, size=n_samples, mode="linear", align_corners=False)
+        tracks = tracks.clamp(self.freq_min, self.freq_max)
+
+        candidates = [tracks]
+        if self.num_candidates > 1:
+            candidates.append(make_smooth_candidate(tracks, kernel_size=self.smooth_kernel))
+        if self.num_candidates > 2:
+            candidates.append(make_smooth_candidate(tracks, kernel_size=self.alt_smooth_kernel))
+        while len(candidates) < self.num_candidates:
+            candidates.append(candidates[-1].clone())
+        return torch.stack(candidates[: self.num_candidates], dim=1)
+
+    def _frame_peaks(self, mag: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        bsz, num_bins, num_frames = mag.shape
+        work = mag.clone()
+        tracks = []
+        bin_hz = float(freqs[1].detach().cpu() - freqs[0].detach().cpu()) if num_bins > 1 else self.min_gap_hz
+        suppress_bins = max(1, int(round(self.min_gap_hz / max(bin_hz, 1.0e-6))))
+        flat_work = work.permute(0, 2, 1).reshape(-1, num_bins)
+        flat_mag = mag.permute(0, 2, 1).reshape(-1, num_bins)
+        rows = torch.arange(flat_work.shape[0], device=mag.device)
+        floor = flat_work.new_full((flat_work.shape[0], 1), float("-inf"))
+
+        for _ in range(self.num_components):
+            peak_idx = flat_work.argmax(dim=1)
+            peak_freq = self._centroid_frequency(flat_mag, freqs, peak_idx, rows)
+            tracks.append(peak_freq.view(bsz, num_frames))
+            for offset in range(-suppress_bins, suppress_bins + 1):
+                idx = (peak_idx + offset).clamp(0, num_bins - 1).view(-1, 1)
+                flat_work.scatter_(1, idx, floor)
+        return torch.stack(tracks, dim=1)
+
+    def _centroid_frequency(
+        self,
+        flat_mag: torch.Tensor,
+        freqs: torch.Tensor,
+        peak_idx: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.centroid_radius <= 0:
+            return freqs[peak_idx]
+        weights = []
+        values = []
+        for offset in range(-self.centroid_radius, self.centroid_radius + 1):
+            idx = (peak_idx + offset).clamp(0, freqs.numel() - 1)
+            weight = flat_mag[rows, idx]
+            weights.append(weight)
+            values.append(weight * freqs[idx])
+        weight_sum = torch.stack(weights, dim=0).sum(dim=0).clamp_min(1.0e-8)
+        return torch.stack(values, dim=0).sum(dim=0) / weight_sum

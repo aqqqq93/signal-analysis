@@ -68,7 +68,7 @@ class CandidateMixer(nn.Module):
         if num_candidates < 1:
             raise ValueError("num_candidates must be at least 1.")
         self.fusion = str(fusion)
-        if self.fusion not in {"bias", "residual", "feature_attention"}:
+        if self.fusion not in {"first", "bias", "residual", "feature_attention"}:
             raise ValueError(f"Unknown candidate fusion mode: {self.fusion}")
         self.bias = nn.Parameter(torch.zeros(num_candidates))
         self.raw_temperature = nn.Parameter(_inverse_softplus(torch.tensor(max(temperature - temperature_min, 1.0e-6))))
@@ -99,7 +99,10 @@ class CandidateMixer(nn.Module):
             raise ValueError(f"Expected candidates [B, C, Q, N], got {tuple(candidate_if_hz.shape)}")
         num_candidates = candidate_if_hz.shape[1]
         bias = self.bias[:num_candidates]
-        if self.fusion == "bias" or signal is None or iccd is None:
+        if self.fusion == "first":
+            weights = candidate_if_hz.new_zeros((candidate_if_hz.shape[0], num_candidates))
+            weights[:, 0] = 1.0
+        elif self.fusion == "bias" or signal is None or iccd is None:
             weights = torch.softmax(bias, dim=0).view(1, -1).expand(candidate_if_hz.shape[0], -1)
         else:
             residual_score = self._residual_scores(candidate_if_hz, signal, iccd)

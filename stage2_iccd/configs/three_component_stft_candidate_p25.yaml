@@ -1,0 +1,83 @@
+seed: 20260812
+device: auto
+run_dir: stage2_iccd/runs/three_component_stft_candidate_p25_conservative
+
+data:
+  fs: 1024.0
+  n_samples: 1024
+  num_components: 3
+  freq_min: 35.0
+  freq_max: 430.0
+  snr_db_min: 2.0
+  snr_db_max: 26.0
+  scenario_weights:
+    linear: 1.0
+    quadratic: 1.0
+    cubic: 1.0
+    sinusoidal_fm: 0.0
+    crossing: 0.0
+    near_parallel: 0.7
+    local_jump: 0.0
+    tangent_or_overlap: 0.0
+  active_components:
+    1: 0.25
+    2: 0.45
+    3: 0.30
+  noise_types:
+    white: 0.65
+    colored: 0.25
+    impulsive: 0.05
+    trend: 0.05
+
+init:
+  mode: stft_peak_ridges
+  num_components: 3
+  num_candidates: 2
+  fs: 1024.0
+  n_fft: 256
+  win_length: 128
+  hop_length: 4
+  freq_min: 35.0
+  freq_max: 430.0
+  min_gap_hz: 10.0
+  centroid_radius: 2
+  smooth_kernel: 31
+  alt_smooth_kernel: 61
+
+iccd:
+  amplitude_order: 8
+  period_factor: 2.0
+  alpha_init: 1.0
+  alpha_min: 0.00001
+  solve_jitter: 0.000001
+
+model:
+  num_candidates: 2
+  candidate_fusion: residual
+  refine_channels: 36
+  refine_layers: 3
+  max_refine_hz: 10.0
+  candidate_temperature: 0.02
+  candidate_temperature_min: 0.001
+
+train:
+  resume: stage2_iccd/runs/three_component_oracle_p2/latest.pt
+  steps: 180
+  batch_size: 5
+  lr: 0.00008
+  weight_decay: 0.000001
+  grad_clip: 0.9
+  print_every: 45
+  save_every: 90
+  val_batches: 4
+  loss:
+    reconstruction: 1.0
+    component: 0.25
+    inactive_component: 0.16
+    if_l1: 0.18
+    smooth: 0.001
+    third_derivative: 0.0002
+    min_gap: 0.00035
+    min_gap_hz: 6.0
+    delta: 0.0012
+    candidate_entropy: 0.0001

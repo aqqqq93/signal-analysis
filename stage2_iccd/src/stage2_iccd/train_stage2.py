@@ -14,7 +14,7 @@ from tqdm import trange
 from ifnet_stage1.config import choose_device, load_config
 from ifnet_stage1.simulation import ChirpSimulator, sim_config_from_dict
 
-from .candidates import FrozenIFNetCandidateProvider, OraclePerturbedCandidateProvider
+from .candidates import FrozenIFNetCandidateProvider, OraclePerturbedCandidateProvider, STFTPeakCandidateProvider
 from .differentiable_iccd import iccd_config_from_dict
 from .losses import (
     candidate_entropy,
@@ -178,6 +178,22 @@ def make_candidate_provider(init_cfg: dict[str, Any], device: torch.device, seed
             smooth_kernel=int(init_cfg.get("smooth_kernel", 31)),
             seed=seed,
         )
+    if mode == "stft_peak_ridges":
+        return STFTPeakCandidateProvider(
+            num_components=int(init_cfg.get("num_components", init_cfg.get("q", 2))),
+            num_candidates=int(init_cfg.get("num_candidates", 2)),
+            fs=float(init_cfg.get("fs", 1024.0)),
+            n_fft=int(init_cfg.get("n_fft", 256)),
+            win_length=int(init_cfg.get("win_length", 128)),
+            hop_length=int(init_cfg.get("hop_length", 4)),
+            freq_min=float(init_cfg.get("freq_min", 35.0)),
+            freq_max=float(init_cfg.get("freq_max", 430.0)),
+            min_gap_hz=float(init_cfg.get("min_gap_hz", 24.0)),
+            centroid_radius=int(init_cfg.get("centroid_radius", 2)),
+            smooth_kernel=int(init_cfg.get("smooth_kernel", 31)),
+            alt_smooth_kernel=int(init_cfg.get("alt_smooth_kernel", 61)),
+            device=device,
+        )
     raise ValueError(f"Unknown init.mode: {mode}")
 
 
@@ -204,7 +220,7 @@ def make_optimizer(model: Stage2ICCDModel, provider, train_cfg: dict[str, Any]) 
 
 
 def get_candidates(provider, init_cfg: dict[str, Any], signal: torch.Tensor, target_if: torch.Tensor, n_samples: int) -> torch.Tensor:
-    if str(init_cfg.get("mode", "oracle_perturbed")) == "frozen_ifnet_checkpoint":
+    if bool(getattr(provider, "signal_only", False)) or str(init_cfg.get("mode", "oracle_perturbed")) == "frozen_ifnet_checkpoint":
         return provider(signal, n_samples)
     return provider(signal, target_if)
 
@@ -435,6 +451,10 @@ def load_stage2_model_state(model: Stage2ICCDModel, state: dict[str, torch.Tenso
         migrated["mixer.bias"] = migrated.pop("mixer.logits")
     current = model.state_dict()
     for key, value in list(migrated.items()):
+        if key not in current:
+            if key.startswith("mixer.quality_net."):
+                migrated.pop(key)
+            continue
         if key not in current or tuple(value.shape) == tuple(current[key].shape):
             continue
         if key == "refine_head.net.0.weight" and value.ndim == 3 and current[key].ndim == 3:

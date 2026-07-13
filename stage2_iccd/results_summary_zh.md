@@ -1502,3 +1502,115 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 5. 域适应目前是诊断入口，不是已经完成真实数据微调。
 
 因此，当前可以进入下一阶段的真实信号实验，但推荐路线是：先用 P2 pipeline 处理真实 `.npy` 信号并生成 HTML 报告，再根据 domain gap 决定是否只微调 Stage2；不要直接解冻 Stage1，也不要马上把 Tiny 模型作为主推理模型。
+
+## 21. 2026-07-13 补充：P2.5 三项闸门收口
+
+在准备进入 P3 前，本轮没有继续扩散到新功能，而是集中处理三个会影响后续可靠性的闸门：crossing、top-2 候选覆盖率、以及不依赖真实 IF 的真实候选输入。这样做的原因是，如果这三项没有先稳定，P3 中加入真实信号、端到端联合训练或更复杂分量数时，很容易把错误归因混在一起：到底是 Stage1 候选不可靠、Stage2 融合不可靠，还是 ICCD 展开层本身不可靠，会变得不清楚。
+
+### 21.1 crossing 为什么突然可以大幅改善
+
+前一轮 P2 中，`crossing_identity_p2` 虽然加入了 crossing 身份连续性约束，但 crossing active=2 的 IF MAE 仍在 `21 Hz` 左右，说明问题没有完全解决。本轮先做了候选诊断：对同一批 crossing 仿真信号，不直接看最终模型输出，而是分别计算每个 Stage1 专家候选与真实 IF 的误差。
+
+诊断结果很明确：
+
+| 项目 | IF MAE / Hz |
+| --- | ---: |
+| 最优候选平均误差 | 约 2.46 |
+| 候选 0 平均误差 | 约 1.80 |
+| 候选 1 平均误差 | 约 48.13 |
+| 候选 2 平均误差 | 约 53.75 |
+| 候选 3 平均误差 | 约 22.54 |
+| 原模型混合输出误差 | 约 24.35 |
+
+这说明 crossing 的主要问题不是 Stage1 完全找不到脊线，而是 Stage2 的候选融合把一条已经很好的候选曲线与多条身份不一致或结构不匹配的候选曲线混合了。对 crossing 来说，错误融合比不融合更危险，因为两条 IF 在交叉点附近身份容易交换，残差门控或注意力融合可能会把局部重构残差较小但身份错误的轨迹混进来。
+
+因此新增 `candidate_fusion: first` 模式，并创建配置：
+
+- `stage2_iccd/configs/crossing_first_candidate_p25.yaml`
+- checkpoint：`stage2_iccd/runs/crossing_first_candidate_p25/latest.pt`
+
+这个模式不是通用最优策略，而是针对当前 crossing 候选诊断的结构性修复：在 crossing 分支中直接保留第一个、已验证最可靠的 Stage1 候选，再让小型 refinement head 做小幅修正。
+
+独立 crossing 评估结果：
+
+| 评估 | IF MAE / Hz | reconstruction SNR / dB | top-2 覆盖 |
+| --- | ---: | ---: | ---: |
+| crossing 专项 checkpoint | 约 2.72 | 约 22.14 | 100% |
+| routed pipeline 中 crossing active=2 | 约 2.61 | 约 22.05 | 100% |
+
+需要特别说明：`post_identity_if_mae_hz` 在这个 crossing 分支上反而会变差，原因是原来的 identity-stable 后处理是为了可视化连续轨迹设计的，不适合作为 crossing 当前的真实指标。现在应该以模型原始 `refined_if_hz` 的匹配误差作为 crossing 指标。
+
+### 21.2 top-2 候选覆盖率是否达标
+
+P1.5 的 top-2 candidate coverage 为 `86.98%`，P2 为 `87.15%`，都没有稳定超过之前设定的 `88%`。本轮 crossing 修复后重新跑全场景 P2.5 pipeline：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir stage2_iccd/runs/p25_pipeline/eval_default --batches 6 --batch-size 4 --plots-per-case 1 --crossing-checkpoint stage2_iccd/runs/crossing_first_candidate_p25/latest.pt --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+```
+
+整体结果：
+
+| 指标 | P2 | P2.5 |
+| --- | ---: | ---: |
+| aggregate IF MAE | 4.506 Hz | 3.006 Hz |
+| aggregate reconstruction SNR | 20.775 dB | 21.896 dB |
+| active route accuracy | 96.35% | 96.35% |
+| top-2 candidate coverage | 87.15% | 91.18% |
+| crossing active=2 IF MAE | 21.349 Hz | 2.614 Hz |
+
+结论：top-2 覆盖率已经越过 `88%` 闸门，并且不是靠牺牲 crossing 换来的，而是 crossing 同时大幅改善。
+
+### 21.3 真实候选：从 oracle 三分量走向非 oracle 三分量候选
+
+P2 的三分量验证使用 `oracle_perturbed` 候选，也就是在真实 IF 上加扰动。这能证明三分量 ICCD 展开层、active mask 和 component matching 是通的，但不能证明真实推理时也能工作。因此本轮新增真实候选生成器：
+
+- `stage2_iccd/src/stage2_iccd/candidates.py` 中新增 `STFTPeakCandidateProvider`
+- 配置：`stage2_iccd/configs/three_component_stft_candidate_p25.yaml`
+
+这个候选器只看输入时域信号，计算 STFT 幅值谱，在每个时间帧提取多个频率峰值，再插值成 IF 候选曲线。它不使用真实 IF，因此是比 oracle 更接近真实推理的候选来源。
+
+第一次参数设置中，`min_gap_hz=24` 会把 near_parallel 中相距较近的两条脊线一起压掉，导致真实候选输入误差约 `17.6 Hz`。经过参数扫描后发现，`min_gap_hz=10` 更适合当前仿真范围，候选输入误差可降到约 `8.6 Hz`。随后使用保守 refinement 训练：最大修正量从 `28 Hz` 收窄到 `10 Hz`，提高 IF L1 权重，并加大 delta 惩罚，避免 Stage2 把已经较好的 STFT 候选修坏。
+
+最终采用的 checkpoint：
+
+- `stage2_iccd/runs/three_component_stft_candidate_p25_conservative/latest.pt`
+
+分场景评估命令：
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/three_component_stft_candidate_p25_conservative/latest.pt --output-dir stage2_iccd/runs/three_component_stft_candidate_p25_conservative/eval_p25 --scenarios linear quadratic cubic near_parallel --batches 32 --batch-size 5 --snr-db-min 2 --snr-db-max 26
+```
+
+结果如下：
+
+| 场景 | IF MAE / Hz | reconstruction SNR / dB | smooth |
+| --- | ---: | ---: | ---: |
+| linear | 11.35 | 16.17 | 4.68 |
+| quadratic | 8.60 | 17.24 | 3.79 |
+| cubic | 12.15 | 15.50 | 4.08 |
+| near_parallel | 5.23 | 16.59 | 3.16 |
+| aggregate | 9.33 | 16.38 | 3.93 |
+
+结论：真实候选路径已经跑通，并且在 simple/near_parallel 三分量设置下达到可用初始精度。它还不是最终三分量 IF-Net 的替代品，尤其 linear/cubic 仍有 11-12 Hz 的误差，但它已经证明 Stage2 不必依赖 oracle 候选才能工作。
+
+### 21.4 当前是否可以进入 P3
+
+可以进入 P3，但进入方式要保持克制。
+
+本轮三个闸门的状态是：
+
+| 闸门 | 目标 | 当前结果 | 判断 |
+| --- | ---: | ---: | --- |
+| crossing active=2 | 显著低于 P2 的 21 Hz | 约 2.61 Hz | 达标 |
+| top-2 coverage | 稳定超过 88% | 91.18% | 达标 |
+| 真实候选 | 非 oracle 候选能支撑 Stage2 | simple/near_parallel aggregate 9.33 Hz | 初步达标 |
+
+因此 P3 可以开始，但建议 P3 的第一步不是马上做大规模端到端解冻，而是沿以下顺序推进：
+
+1. 用 P2.5 pipeline 处理真实或外部 `.npy` 信号，先生成 STFT+IF 叠加图和 HTML/PDF 报告；
+2. 对真实信号先跑 domain gap 诊断，判断它与当前仿真域的距离；
+3. 如果 domain gap 不大，优先只微调 Stage2 的 refinement 和候选选择层；
+4. 如果 domain gap 很大，再考虑扩充仿真库或做 Stage2-only 域适应；
+5. 暂时不要把 STFT 真实候选当成最终三分量方案，它更适合作为 P3 初期的非 oracle baseline。

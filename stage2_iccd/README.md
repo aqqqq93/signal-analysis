@@ -73,7 +73,9 @@ Because the dictionary is built with PyTorch tensors and the solve uses `torch.l
 - `configs/simple_multicomponent_unfreeze_head_p1.yaml`: safer head-only unfreeze probe; diagnostic only, not the default checkpoint.
 - `configs/active_count_123_peak_p1.yaml`: P1 active-count router extended to 1/2/3 components with peak-count auxiliary features.
 - `configs/crossing_identity_p2.yaml`: P2 crossing-specialist fine-tuning with identity-continuity and physical IF regularizers.
+- `configs/crossing_first_candidate_p25.yaml`: P2.5 crossing repair that keeps the empirically correct first Stage1 candidate instead of residual-mixing incompatible crossing tracks.
 - `configs/three_component_oracle_p2.yaml`: P2 three-component differentiable ICCD validation with oracle-perturbed IF candidates.
+- `configs/three_component_stft_candidate_p25.yaml`: P2.5 non-oracle three-component candidate validation from STFT peak ridges.
 - `configs/sinusoidal_frozen.yaml`: focused sinusoidal-FM stage-2 specialist.
 - `configs/default.yaml`: quick debug training with perturbed ground-truth IF candidates.
 - `configs/frozen_ifnet.yaml`: real stage-2 training initialized by a frozen stage-1 checkpoint.
@@ -237,6 +239,16 @@ $env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
 .\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/three_component_oracle_p2/latest.pt --output-dir stage2_iccd/runs/three_component_oracle_p2/eval_p2 --scenarios linear quadratic cubic near_parallel crossing --batches 12 --batch-size 5 --snr-db-min 0 --snr-db-max 24
 ```
 
+P2.5 crossing/top-2/real-candidate gates:
+
+```powershell
+$env:PYTHONPATH="stage2_iccd/src;ifnet_stage1/src"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/crossing_first_candidate_p25.yaml
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_p15_pipeline --output-dir stage2_iccd/runs/p25_pipeline/eval_default --batches 6 --batch-size 4 --plots-per-case 1 --crossing-checkpoint stage2_iccd/runs/crossing_first_candidate_p25/latest.pt --snr-db-min -2 --snr-db-max 24 --noise-types-json "{white:0.55,colored:0.25,impulsive:0.10,trend:0.10}"
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.train_stage2 --config stage2_iccd/configs/three_component_stft_candidate_p25.yaml --run-dir stage2_iccd/runs/three_component_stft_candidate_p25_conservative
+.\.venv_ifnet\Scripts\python.exe -m stage2_iccd.eval_scenarios --checkpoint stage2_iccd/runs/three_component_stft_candidate_p25_conservative/latest.pt --output-dir stage2_iccd/runs/three_component_stft_candidate_p25_conservative/eval_p25 --scenarios linear quadratic cubic near_parallel --batches 32 --batch-size 5 --snr-db-min 2 --snr-db-max 26
+```
+
 P2 domain-gap diagnostic and HTML report:
 
 ```powershell
@@ -300,3 +312,10 @@ For a closer match to the stage-1 soft top-2 workflow, `configs/frozen_ifnet.yam
 - `three_component_oracle_p2.yaml` validates that differentiable ICCD, active masks, and component matching work for three output components. It is not yet a real three-component IF-Net deployment path.
 - `domain_adaptation.py` measures STFT feature gaps for external `.npy` signals before Stage2-only fine-tuning. It does not update Stage1.
 - `train_tiny_distill.py` provides the distillation path from the routed Stage2 teacher to a lightweight student. The current short run is diagnostic; it is not a default inference replacement.
+
+## Current P2.5 Gate Status
+
+- Crossing is now routed through `crossing_first_candidate_p25`. The candidate diagnosis showed Stage1 candidate 0 was already close to the true crossing tracks, while residual/attention fusion averaged it with incompatible expert candidates. The repaired routed evaluation gives crossing active=2 IF MAE around `2.61 Hz`; the old identity-stabilized postprocess should not be used as the metric for crossing because it can swap a correct raw refined curve.
+- The all-scenario P2.5 pipeline reaches aggregate top-2 candidate coverage `91.18%`, above the previous `88%` gate.
+- `STFTPeakCandidateProvider` is the first non-oracle three-component candidate generator. With `min_gap_hz: 10` and conservative refinement, simple/near-parallel three-component validation reaches aggregate IF MAE around `9.33 Hz` without using true IF labels as candidates.
+- These three gates are sufficient to enter P3, but P3 should keep the STFT ridge candidate path as a baseline rather than treating it as a final replacement for a learned three-component IF-Net.
